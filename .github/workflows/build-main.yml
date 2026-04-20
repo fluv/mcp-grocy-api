@@ -2,7 +2,8 @@ name: Build and push image on main
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
+  workflow_dispatch:
 
 jobs:
   build:
