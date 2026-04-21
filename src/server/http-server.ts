@@ -52,11 +52,10 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
 
   // GET /mcp — SSE keepalive stream (server-to-client notifications)
   //
-  // We deliberately do NOT call transport.handleRequest here. With enableJsonResponse:true
-  // all POST responses go inline in the HTTP response body. Calling handleRequest on the GET
-  // would register the SSE stream as the response channel, causing a race condition when
-  // ClaudeAI sends GET+POST simultaneously: the POST handler sees an active SSE channel and
-  // tries to route its response through it before the stream is fully established.
+  // We deliberately do NOT call transport.handleRequest here. With enableJsonResponse:false
+  // (POST SSE mode), responses go back via the POST response stream, not this GET stream.
+  // Registering this GET stream with the transport would not route responses here (the SDK
+  // only uses the standalone SSE for notifications), but avoids any potential confusion.
   //
   // Grocy has no server-initiated notifications, so this stream is keepalive-only.
   app.get('/mcp', (req, res) => {
@@ -142,7 +141,7 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
           onsessioninitialized: (initializedSid: string) => {
             console.error(`[DEBUG] Session initialized with ID: ${initializedSid}`);
           },
-          enableJsonResponse: true
+          enableJsonResponse: false
         });
 
         transport = newTransportInstance;
