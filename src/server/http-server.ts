@@ -50,8 +50,16 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
     next();
   });
 
-  // GET /mcp — SSE stream for server-to-client messages (streamable HTTP transport)
-  app.get('/mcp', async (req, res) => {
+  // GET /mcp — SSE keepalive stream (server-to-client notifications)
+  //
+  // We deliberately do NOT call transport.handleRequest here. With enableJsonResponse:true
+  // all POST responses go inline in the HTTP response body. Calling handleRequest on the GET
+  // would register the SSE stream as the response channel, causing a race condition when
+  // ClaudeAI sends GET+POST simultaneously: the POST handler sees an active SSE channel and
+  // tries to route its response through it before the stream is fully established.
+  //
+  // Grocy has no server-initiated notifications, so this stream is keepalive-only.
+  app.get('/mcp', (req, res) => {
     const clientSessionId = req.headers['mcp-session-id'] as string | undefined;
 
     if (!clientSessionId) {
@@ -59,23 +67,23 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
       return;
     }
 
-    const transport = streamableTransports[clientSessionId];
-    if (!transport) {
+    if (!streamableTransports[clientSessionId]) {
       console.error(`[DEBUG] GET /mcp: session ${clientSessionId} not found — returning 404`);
       res.status(404).json({ error: `Session not found: ${clientSessionId}` });
       return;
     }
 
-    console.error(`[DEBUG] GET /mcp: opening SSE stream for session ${clientSessionId}`);
+    console.error(`[DEBUG] GET /mcp: opening keepalive SSE stream for session ${clientSessionId}`);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
     res.setHeader('Mcp-Session-Id', clientSessionId);
+    res.flushHeaders();
 
-    // Keepalive ping every 30s to prevent nginx from closing idle SSE connections
     const keepalive = setInterval(() => {
       if (!res.writableEnded) res.write(': ping\n\n');
     }, 30000);
     res.on('close', () => clearInterval(keepalive));
-
-    await transport.handleRequest(req, res);
   });
 
   // POST /mcp — main request channel (streamable HTTP transport)
