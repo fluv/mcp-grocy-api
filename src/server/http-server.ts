@@ -10,15 +10,20 @@ import http from 'http';
 // Patch a transport's send() to fall back to the standalone GET SSE when the
 // POST connection closes before a response is ready.
 //
-// ClaudeAI sends GET before every POST and expects responses on the GET stream.
-// The POST connection closes immediately after the request body is sent.
-// Without this patch those responses are lost with "No connection established".
+// ClaudeAI sends GET before every POST and closes the POST connection
+// immediately after the request body is sent, expecting responses on the GET
+// SSE stream.  Without this patch those responses are lost with:
+//   "No connection established for request ID: N"
 //
-// The patch:
-//   1. Tries the normal send path.
-//   2. On "No connection established", looks up the standalone SSE registered
-//      by the GET handler and writes the JSON-RPC response there directly.
-function patchTransportSend(transport: StreamableHTTPServerTransport) {
+// When the GET SSE is available the response is written there directly.
+// When it is not (the client closed the old GET and hasn't opened the new one
+// yet — common for fast Grocy errors like 400s), the response is buffered in
+// pendingResponses and flushed as soon as the next GET arrives for the same
+// session.
+function patchTransportSend(
+  transport: StreamableHTTPServerTransport,
+  pendingResponses: Map<string, any[]>
+) {
   const original = (transport as any).send.bind(transport);
   (transport as any).send = async (message: any, options?: any) => {
     try {
@@ -27,11 +32,20 @@ function patchTransportSend(transport: StreamableHTTPServerTransport) {
       if (error?.message?.includes('No connection established for request ID')) {
         const standaloneSseId: string = (transport as any)._standaloneSseStreamId;
         const sseStream = (transport as any)._streamMapping?.get(standaloneSseId);
+
         if (sseStream && !sseStream.writableEnded) {
-          console.error(`[FALLBACK] POST closed — routing response to GET SSE (${error.message})`);
+          console.error(`[FALLBACK] POST closed — routing response to open GET SSE`);
           sseStream.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
         } else {
-          console.error(`[FALLBACK] POST closed and no GET SSE available — response dropped (${error.message})`);
+          // GET SSE not available yet (client is between GETs); buffer until next GET.
+          const sessionId: string | undefined = transport.sessionId;
+          if (sessionId) {
+            console.error(`[FALLBACK] No GET SSE — buffering response for session ${sessionId}`);
+            if (!pendingResponses.has(sessionId)) pendingResponses.set(sessionId, []);
+            pendingResponses.get(sessionId)!.push(message);
+          } else {
+            console.error(`[FALLBACK] No session ID — response dropped (${error.message})`);
+          }
         }
       } else {
         throw error;
@@ -77,23 +91,26 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
   const streamableTransports: Record<string, StreamableHTTPServerTransport> = {};
   const sseTransports: Record<string, SSEServerTransport> = {};
 
+  // Buffered responses for sessions where the GET SSE wasn't available when
+  // the POST response was ready (flushed on the next GET for the same session).
+  const pendingResponses: Map<string, any[]> = new Map();
+
   // Middleware to log all requests
   app.use((req, res, next) => {
     console.error(`[${new Date().toISOString()}] ${req.method} ${req.path} - Headers: ${JSON.stringify(req.headers)}`);
     next();
   });
 
-  // GET /mcp — SSE keepalive + fallback response channel
+  // GET /mcp — SSE channel: keepalive + fallback response delivery
   //
-  // We do NOT call transport.handleRequest here to avoid the SDK's "only one GET
-  // SSE per session" conflict check (which returns 409 when the client opens a new
-  // GET while the old one is still alive).
+  // We do NOT call transport.handleRequest here to avoid the SDK's
+  // single-stream-per-session limit (which returns 409 when the client
+  // reopens GET between tool calls).
   //
-  // Instead we manually inject the GET response object into the transport's
-  // internal _streamMapping under the _standaloneSseStreamId key.  The patched
-  // transport.send() (see patchTransportSend above) will route tool responses here
-  // when the POST connection closes before the response is ready — which is what
-  // the ClaudeAI client does on every tool call.
+  // Instead:
+  //   1. We manually inject res into the transport's _streamMapping so
+  //      patchTransportSend can route responses here when POST closes early.
+  //   2. We flush any responses buffered while the GET was unavailable.
   app.get('/mcp', (req, res) => {
     const clientSessionId = req.headers['mcp-session-id'] as string | undefined;
 
@@ -109,18 +126,29 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
       return;
     }
 
-    console.error(`[DEBUG] GET /mcp: opening SSE stream for session ${clientSessionId}`);
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Mcp-Session-Id', clientSessionId);
     res.flushHeaders();
 
-    // Register this response as the standalone SSE channel so patchTransportSend
-    // can route fallback responses here.
+    // Register as the standalone SSE fallback channel.
     const standaloneSseId: string = (transport as any)._standaloneSseStreamId;
     if (standaloneSseId) {
       (transport as any)._streamMapping?.set(standaloneSseId, res);
+      console.error(`[DEBUG] GET /mcp: SSE registered for session ${clientSessionId}`);
+    }
+
+    // Flush any responses buffered while GET was unavailable.
+    const pending = pendingResponses.get(clientSessionId);
+    if (pending?.length) {
+      console.error(`[FALLBACK] Flushing ${pending.length} buffered response(s) to new GET SSE`);
+      for (const message of pending) {
+        if (!res.writableEnded) {
+          res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
+        }
+      }
+      pendingResponses.delete(clientSessionId);
     }
 
     const keepalive = setInterval(() => {
@@ -129,13 +157,10 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
 
     res.on('close', () => {
       clearInterval(keepalive);
-      // Only deregister if this is still the current standalone SSE (a newer GET
-      // may have already replaced it).
+      // Deregister only if this is still the current GET SSE.
       if (standaloneSseId) {
         const current = (transport as any)._streamMapping?.get(standaloneSseId);
-        if (current === res) {
-          (transport as any)._streamMapping?.delete(standaloneSseId);
-        }
+        if (current === res) (transport as any)._streamMapping?.delete(standaloneSseId);
       }
     });
   });
@@ -200,7 +225,7 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
         });
 
         // Patch send() to fall back to GET SSE when POST closes early.
-        patchTransportSend(newTransportInstance);
+        patchTransportSend(newTransportInstance, pendingResponses);
 
         transport = newTransportInstance;
         streamableTransports[newGeneratedSessionId] = transport;
@@ -209,6 +234,7 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
           const closedSessionId = transport?.sessionId || newGeneratedSessionId;
           console.error(`[DEBUG] Transport for session ${closedSessionId} closed. Removing.`);
           delete streamableTransports[closedSessionId];
+          pendingResponses.delete(closedSessionId);
         };
 
         console.error(`[DEBUG] Connecting new transport (ID: ${newGeneratedSessionId}) to MCP server`);
