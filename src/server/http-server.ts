@@ -133,7 +133,8 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
           },
           onsessioninitialized: (initializedSid: string) => {
             console.error(`[DEBUG] Session initialized with ID: ${initializedSid}`);
-          }
+          },
+          enableJsonResponse: true
         });
 
         transport = newTransportInstance;
