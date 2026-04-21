@@ -7,6 +7,39 @@ import { VERSION, PACKAGE_NAME as SERVER_NAME } from '../version.js';
 import cors from 'cors';
 import http from 'http';
 
+// Patch a transport's send() to fall back to the standalone GET SSE when the
+// POST connection closes before a response is ready.
+//
+// ClaudeAI sends GET before every POST and expects responses on the GET stream.
+// The POST connection closes immediately after the request body is sent.
+// Without this patch those responses are lost with "No connection established".
+//
+// The patch:
+//   1. Tries the normal send path.
+//   2. On "No connection established", looks up the standalone SSE registered
+//      by the GET handler and writes the JSON-RPC response there directly.
+function patchTransportSend(transport: StreamableHTTPServerTransport) {
+  const original = (transport as any).send.bind(transport);
+  (transport as any).send = async (message: any, options?: any) => {
+    try {
+      await original(message, options);
+    } catch (error: any) {
+      if (error?.message?.includes('No connection established for request ID')) {
+        const standaloneSseId: string = (transport as any)._standaloneSseStreamId;
+        const sseStream = (transport as any)._streamMapping?.get(standaloneSseId);
+        if (sseStream && !sseStream.writableEnded) {
+          console.error(`[FALLBACK] POST closed — routing response to GET SSE (${error.message})`);
+          sseStream.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
+        } else {
+          console.error(`[FALLBACK] POST closed and no GET SSE available — response dropped (${error.message})`);
+        }
+      } else {
+        throw error;
+      }
+    }
+  };
+}
+
 // HTTP Transport for MCP (Context7 style)
 export function startHttpServer(mcpServer: Server, port: number = 8080) {
   const app = express();
@@ -50,14 +83,17 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
     next();
   });
 
-  // GET /mcp — SSE keepalive stream (server-to-client notifications)
+  // GET /mcp — SSE keepalive + fallback response channel
   //
-  // We deliberately do NOT call transport.handleRequest here. With enableJsonResponse:false
-  // (POST SSE mode), responses go back via the POST response stream, not this GET stream.
-  // Registering this GET stream with the transport would not route responses here (the SDK
-  // only uses the standalone SSE for notifications), but avoids any potential confusion.
+  // We do NOT call transport.handleRequest here to avoid the SDK's "only one GET
+  // SSE per session" conflict check (which returns 409 when the client opens a new
+  // GET while the old one is still alive).
   //
-  // Grocy has no server-initiated notifications, so this stream is keepalive-only.
+  // Instead we manually inject the GET response object into the transport's
+  // internal _streamMapping under the _standaloneSseStreamId key.  The patched
+  // transport.send() (see patchTransportSend above) will route tool responses here
+  // when the POST connection closes before the response is ready — which is what
+  // the ClaudeAI client does on every tool call.
   app.get('/mcp', (req, res) => {
     const clientSessionId = req.headers['mcp-session-id'] as string | undefined;
 
@@ -66,23 +102,42 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
       return;
     }
 
-    if (!streamableTransports[clientSessionId]) {
+    const transport = streamableTransports[clientSessionId];
+    if (!transport) {
       console.error(`[DEBUG] GET /mcp: session ${clientSessionId} not found — returning 404`);
       res.status(404).json({ error: `Session not found: ${clientSessionId}` });
       return;
     }
 
-    console.error(`[DEBUG] GET /mcp: opening keepalive SSE stream for session ${clientSessionId}`);
+    console.error(`[DEBUG] GET /mcp: opening SSE stream for session ${clientSessionId}`);
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Mcp-Session-Id', clientSessionId);
     res.flushHeaders();
 
+    // Register this response as the standalone SSE channel so patchTransportSend
+    // can route fallback responses here.
+    const standaloneSseId: string = (transport as any)._standaloneSseStreamId;
+    if (standaloneSseId) {
+      (transport as any)._streamMapping?.set(standaloneSseId, res);
+    }
+
     const keepalive = setInterval(() => {
       if (!res.writableEnded) res.write(': ping\n\n');
     }, 30000);
-    res.on('close', () => clearInterval(keepalive));
+
+    res.on('close', () => {
+      clearInterval(keepalive);
+      // Only deregister if this is still the current standalone SSE (a newer GET
+      // may have already replaced it).
+      if (standaloneSseId) {
+        const current = (transport as any)._streamMapping?.get(standaloneSseId);
+        if (current === res) {
+          (transport as any)._streamMapping?.delete(standaloneSseId);
+        }
+      }
+    });
   });
 
   // POST /mcp — main request channel (streamable HTTP transport)
@@ -141,8 +196,11 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
           onsessioninitialized: (initializedSid: string) => {
             console.error(`[DEBUG] Session initialized with ID: ${initializedSid}`);
           },
-          enableJsonResponse: false
+          enableJsonResponse: true
         });
+
+        // Patch send() to fall back to GET SSE when POST closes early.
+        patchTransportSend(newTransportInstance);
 
         transport = newTransportInstance;
         streamableTransports[newGeneratedSessionId] = transport;
