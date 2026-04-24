@@ -87,25 +87,6 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
     });
   });
 
-  // OAuth discovery endpoints — tell clients no auth is required.
-  // The MCP 2025-11-25 client probes these unconditionally; 404 causes it to
-  // give up rather than proceeding without auth.
-  const oauthMetadata = { resource: '', authorization_servers: [] as string[] };
-  app.get('/.well-known/oauth-protected-resource', (req, res) => {
-    oauthMetadata.resource = `${req.protocol}://${req.hostname}`;
-    res.json(oauthMetadata);
-  });
-  app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
-    oauthMetadata.resource = `${req.protocol}://${req.hostname}`;
-    res.json(oauthMetadata);
-  });
-  app.get('/.well-known/oauth-authorization-server', (_req, res) => {
-    res.status(404).json({ error: 'not_found' });
-  });
-  app.post('/register', (_req, res) => {
-    res.status(400).json({ error: 'invalid_client_metadata', error_description: 'Dynamic client registration is not supported' });
-  });
-
   // Session management for transports
   const streamableTransports: Record<string, StreamableHTTPServerTransport> = {};
   const sseTransports: Record<string, SSEServerTransport> = {};
