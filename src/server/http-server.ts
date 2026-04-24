@@ -7,6 +7,31 @@ import { VERSION, PACKAGE_NAME as SERVER_NAME } from '../version.js';
 import cors from 'cors';
 import http from 'http';
 
+// Fail-fast watchdog: if "No connection established for request ID" errors
+// recur rapidly, the transport is wedged in a way the fallback paths below
+// can't recover from.  Exit(1) so Kubernetes restarts the pod rather than
+// letting the client hang indefinitely waiting for responses that will never
+// arrive.  Sliding window: N errors within T ms.
+const STUCK_ERROR_THRESHOLD = 3;
+const STUCK_ERROR_WINDOW_MS = 60_000;
+const stuckErrorTimestamps: number[] = [];
+
+function recordStuckError(context: string) {
+  const now = Date.now();
+  stuckErrorTimestamps.push(now);
+  while (stuckErrorTimestamps.length > 0 && stuckErrorTimestamps[0]! < now - STUCK_ERROR_WINDOW_MS) {
+    stuckErrorTimestamps.shift();
+  }
+  if (stuckErrorTimestamps.length >= STUCK_ERROR_THRESHOLD) {
+    console.error(
+      `[FATAL] ${stuckErrorTimestamps.length} "No connection established" errors ` +
+        `within ${STUCK_ERROR_WINDOW_MS}ms (${context}); transport is wedged, exiting ` +
+        `to let Kubernetes restart the pod.`
+    );
+    process.exit(1);
+  }
+}
+
 // Patch a transport's send() to fall back to the standalone GET SSE when the
 // POST connection closes before a response is ready.
 //
@@ -47,6 +72,8 @@ function patchTransportSend(
             console.error(`[FALLBACK] No session ID — response dropped (${error.message})`);
           }
         }
+
+        recordStuckError(transport.sessionId ?? 'no-session');
       } else {
         throw error;
       }
