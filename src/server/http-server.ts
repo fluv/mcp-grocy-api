@@ -173,7 +173,7 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
 
       // Accept header check (can be done early)
       const accept = req.headers.accept || '';
-      if (!accept.includes('application/json') && !accept.includes('text/event-stream')) {
+      if (!accept.includes('application/json') && !accept.includes('text/event-stream') && !accept.includes('*/*')) {
         console.error('[ERROR] Client must accept application/json or text/event-stream');
         res.status(406).json({
           jsonrpc: '2.0',
