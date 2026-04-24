@@ -273,6 +273,10 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
         res.setHeader('Mcp-Session-Id', transport.sessionId);
       }
 
+      const { method: rpcMethod, id: rpcId, params: rpcParams } = req.body || {};
+      const paramsPreview = rpcParams ? JSON.stringify(rpcParams).slice(0, 200) : 'none';
+      console.error(`[REQ] session=${transport.sessionId ?? 'none'} method=${rpcMethod} id=${JSON.stringify(rpcId)} params=${paramsPreview}`);
+
       await transport.handleRequest(req, res, req.body);
 
     } catch (error) {
