@@ -82,7 +82,13 @@ function patchTransportSend(
 }
 
 // HTTP Transport for MCP (Context7 style)
-export function startHttpServer(mcpServer: Server, port: number = 8080) {
+//
+// Each session gets its own Server instance via the factory. The MCP SDK's
+// Server class stores a single _transport reference; sharing one Server across
+// multiple sessions causes responses for session A to be sent via session B's
+// transport after B connects (overwriting _transport), producing cross-session
+// "No connection established" errors and lost responses.
+export function startHttpServer(createMcpServer: () => Server, port: number = 8080) {
   const app = express();
 
   // Enable JSON body parsing with increased limit
@@ -114,9 +120,11 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
     });
   });
 
-  // Session management for transports
+  // Session management: one transport + one Server per session.
   const streamableTransports: Record<string, StreamableHTTPServerTransport> = {};
+  const streamableServers: Record<string, Server> = {};
   const sseTransports: Record<string, SSEServerTransport> = {};
+  const sseServers: Record<string, Server> = {};
 
   // Buffered responses for sessions where the GET SSE wasn't available when
   // the POST response was ready (flushed on the next GET for the same session).
@@ -236,9 +244,14 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
       }
 
       if (!transport) {
-        // No session ID provided, or stale session on initialize — create new transport
+        // No session ID provided, or stale session on initialize — create new transport.
+        // A fresh Server instance is created for each session: the MCP SDK stores a
+        // single _transport on the Server and overwrites it on every connect(), so a
+        // shared Server causes responses for session A to be dispatched through session
+        // B's transport after B connects.
         console.error('[DEBUG] No active transport found. Creating new transport.');
         const newGeneratedSessionId = randomUUID();
+        const sessionServer = createMcpServer();
 
         const newTransportInstance = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => {
@@ -256,17 +269,27 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
 
         transport = newTransportInstance;
         streamableTransports[newGeneratedSessionId] = transport;
+        streamableServers[newGeneratedSessionId] = sessionServer;
 
-        transport.onclose = () => {
+        console.error(`[DEBUG] Connecting new transport (ID: ${newGeneratedSessionId}) to session server`);
+        await sessionServer.connect(transport);
+        console.error(`[DEBUG] New transport connected`);
+
+        // Re-install cleanup AFTER connect(): the SDK's connect() overwrites
+        // transport.onclose to clear its own _transport reference.  We chain our
+        // cleanup so both the SDK and the HTTP layer tidy up correctly.
+        const sdkOnClose = transport.onclose;
+        transport.onclose = async () => {
+          await sdkOnClose?.();
           const closedSessionId = transport?.sessionId || newGeneratedSessionId;
           console.error(`[DEBUG] Transport for session ${closedSessionId} closed. Removing.`);
           delete streamableTransports[closedSessionId];
+          delete streamableServers[closedSessionId];
           pendingResponses.delete(closedSessionId);
+          sessionServer.close().catch((err: Error) =>
+            console.error(`[DEBUG] Error closing session server ${closedSessionId}:`, err)
+          );
         };
-
-        console.error(`[DEBUG] Connecting new transport (ID: ${newGeneratedSessionId}) to MCP server`);
-        await mcpServer.connect(transport);
-        console.error(`[DEBUG] New transport connected`);
       }
 
       if (transport.sessionId) {
@@ -302,9 +325,11 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
 
       const transport = new SSEServerTransport('/mcp/messages', res);
       const sessionId = transport.sessionId;
+      const sseSessionServer = createMcpServer();
 
       console.error(`[DEBUG] Created SSE transport with session ID: ${sessionId}`);
       sseTransports[sessionId] = transport;
+      sseServers[sessionId] = sseSessionServer;
 
       const keepalive = setInterval(() => {
         if (!res.writableEnded) res.write(': ping\n\n');
@@ -314,15 +339,20 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
         console.error(`[DEBUG] SSE connection closed for session ID: ${sessionId}`);
         clearInterval(keepalive);
         delete sseTransports[sessionId];
+        delete sseServers[sessionId];
+        sseSessionServer.close().catch((err: Error) =>
+          console.error(`[DEBUG] Error closing SSE session server ${sessionId}:`, err)
+        );
       });
 
       res.on('error', (err) => {
         console.error(`[ERROR] SSE connection error for session ID: ${sessionId}:`, err);
         clearInterval(keepalive);
         delete sseTransports[sessionId];
+        delete sseServers[sessionId];
       });
 
-      await mcpServer.connect(transport);
+      await sseSessionServer.connect(transport);
       console.error(`[DEBUG] SSE transport connected for session ${sessionId}`);
       res.write(': connected\n\n');
     } catch (error) {

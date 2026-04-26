@@ -257,6 +257,72 @@ class GrocyApiServer {
     });
   }
   
+  // Create a fresh Server instance with all handlers registered, for use as a
+  // per-session server in the HTTP transport.  Each HTTP session must have its
+  // own Server because the MCP SDK stores a single _transport reference on the
+  // Server object and overwrites it on every connect() call; sharing one Server
+  // across sessions causes responses for session A to be dispatched through
+  // session B's transport after B connects.
+  //
+  // Implementation: temporarily swap this.server so that setupToolHandlers /
+  // setupResourceHandlers (which reference this.server internally) register
+  // their handlers on the new server.  Both methods are synchronous, so there
+  // is no risk of concurrent mutation during the swap.
+  public createSessionServer(): Server {
+    const sessionServer = new Server(
+      {
+        name: SERVER_NAME,
+        version: VERSION,
+        serverUrl: "https://github.com/saya6k/mcp-grocy-api",
+        documentationUrl: "https://github.com/saya6k/mcp-grocy-api/blob/main/README.md"
+      },
+      {
+        capabilities: {
+          tools: {},
+          resources: {},
+          prompts: {}
+        },
+      }
+    );
+
+    const savedServer = this.server;
+    this.server = sessionServer;
+    this.setupToolHandlers();
+    this.setupResourceHandlers();
+    this.server = savedServer;
+
+    sessionServer.onerror = (error) => console.error('[MCP Error]', error);
+
+    sessionServer.setRequestHandler(InitializeRequestSchema, async (request) => {
+      console.error('[DEBUG] Initialize handler called with request:', JSON.stringify(request));
+      return {
+        capabilities: { tools: {}, resources: {}, prompts: {} },
+        serverInfo: { name: SERVER_NAME, version: VERSION }
+      };
+    });
+
+    const PlainInitializeRequestSchema = z.object({
+      jsonrpc: z.literal('2.0'),
+      id: z.union([z.string(), z.number()]).optional(),
+      method: z.literal('initialize'),
+      params: z.any().optional()
+    });
+    sessionServer.setRequestHandler(PlainInitializeRequestSchema, async (request) => {
+      console.error('[DEBUG] Plain "initialize" handler called with request:', JSON.stringify(request));
+      let protocolVersion = '2024-11-05';
+      if (request.params && typeof request.params.protocolVersion === 'string') {
+        protocolVersion = request.params.protocolVersion;
+      }
+      return {
+        protocolVersion,
+        capabilities: { tools: {}, resources: {}, prompts: {} },
+        serverInfo: { name: SERVER_NAME, version: VERSION }
+      };
+    });
+
+    return sessionServer;
+  }
+
   private makeApiRequest = async (endpoint: string, method: Method = 'GET', body: any = null, additionalHeaders: Record<string, string> = {}, isSpecial: boolean = false): Promise<any> => {
     // Enhanced endpoint path handling with better logging (using stderr to avoid breaking JSON responses)
     console.error(`Original endpoint: ${endpoint}, Method: ${method}, isSpecial: ${isSpecial}`);
@@ -1927,7 +1993,7 @@ class GrocyApiServer {
         
         // Start HTTP server
         console.error(`[CONFIG] Starting HTTP/SSE server on port ${port}`);
-        startHttpServer(this.server, port);
+        startHttpServer(() => this.createSessionServer(), port);
       } catch (error) {
         console.error(`[ERROR] Failed to start HTTP/SSE server:`, error);
       }
