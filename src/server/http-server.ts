@@ -6,6 +6,8 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { VERSION, PACKAGE_NAME as SERVER_NAME } from '../version.js';
 import cors from 'cors';
 import http from 'http';
+import axios from 'axios';
+import https from 'https';
 
 // Fail-fast watchdog: if "No connection established for request ID" errors
 // recur rapidly, the transport is wedged in a way the fallback paths below
@@ -81,6 +83,18 @@ function patchTransportSend(
   };
 }
 
+function buildGrocyClient() {
+  const baseURL = process.env.GROCY_BASE_URL || '';
+  const apiKey = process.env.GROCY_APIKEY_VALUE || '';
+  const sslVerify = process.env.GROCY_ENABLE_SSL_VERIFY !== 'false';
+  return axios.create({
+    baseURL,
+    headers: { 'GROCY-API-KEY': apiKey },
+    timeout: 10_000,
+    ...(sslVerify ? {} : { httpsAgent: new https.Agent({ rejectUnauthorized: false }) }),
+  });
+}
+
 // HTTP Transport for MCP (Context7 style)
 //
 // Each session gets its own Server instance via the factory. The MCP SDK's
@@ -129,6 +143,72 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
   // Buffered responses for sessions where the GET SSE wasn't available when
   // the POST response was ready (flushed on the next GET for the same session).
   const pendingResponses: Map<string, any[]> = new Map();
+
+  // Prometheus metrics — registered before the request logger to keep scrapes out of logs.
+  app.get('/metrics', async (_req, res) => {
+    const start = Date.now();
+    try {
+      const client = buildGrocyClient();
+      const [volatile, shoppingList, tasks] = await Promise.all([
+        client.get('/api/stock/volatile').then((r: any) => r.data),
+        client.get('/api/objects/shopping_list').then((r: any) => r.data),
+        client.get('/api/objects/tasks').then((r: any) => r.data),
+      ]);
+      const duration = (Date.now() - start) / 1000;
+
+      const expired  = Array.isArray(volatile?.expired_products)  ? volatile.expired_products.length  : 0;
+      const overdue  = Array.isArray(volatile?.overdue_products)  ? volatile.overdue_products.length  : 0;
+      const dueSoon  = Array.isArray(volatile?.due_soon_products) ? volatile.due_soon_products.length : 0;
+      const missing  = Array.isArray(volatile?.missing_products)  ? volatile.missing_products.length  : 0;
+      const shopping = Array.isArray(shoppingList) ? shoppingList.length : 0;
+      const openTasks = Array.isArray(tasks)
+        ? tasks.filter((t: any) => Number(t.done) === 0).length
+        : 0;
+
+      const body = [
+        '# HELP grocy_up 1 if the Grocy API is reachable, 0 otherwise',
+        '# TYPE grocy_up gauge',
+        'grocy_up 1',
+        '# HELP grocy_scrape_duration_seconds Duration of the last Grocy API scrape in seconds',
+        '# TYPE grocy_scrape_duration_seconds gauge',
+        `grocy_scrape_duration_seconds ${duration.toFixed(3)}`,
+        '# HELP grocy_stock_expired_products_total Number of expired products in stock',
+        '# TYPE grocy_stock_expired_products_total gauge',
+        `grocy_stock_expired_products_total ${expired}`,
+        '# HELP grocy_stock_overdue_products_total Number of overdue products past best-before date',
+        '# TYPE grocy_stock_overdue_products_total gauge',
+        `grocy_stock_overdue_products_total ${overdue}`,
+        '# HELP grocy_stock_due_soon_products_total Number of products due soon in stock',
+        '# TYPE grocy_stock_due_soon_products_total gauge',
+        `grocy_stock_due_soon_products_total ${dueSoon}`,
+        '# HELP grocy_stock_missing_products_total Number of products below minimum stock level',
+        '# TYPE grocy_stock_missing_products_total gauge',
+        `grocy_stock_missing_products_total ${missing}`,
+        '# HELP grocy_shopping_list_items_total Number of items on the shopping list',
+        '# TYPE grocy_shopping_list_items_total gauge',
+        `grocy_shopping_list_items_total ${shopping}`,
+        '# HELP grocy_tasks_open_total Number of open (incomplete) tasks',
+        '# TYPE grocy_tasks_open_total gauge',
+        `grocy_tasks_open_total ${openTasks}`,
+      ].join('\n') + '\n';
+
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      res.status(200).send(body);
+    } catch (err: any) {
+      const duration = (Date.now() - start) / 1000;
+      console.error('[ERROR] /metrics Grocy scrape failed:', err?.message);
+      const body = [
+        '# HELP grocy_up 1 if the Grocy API is reachable, 0 otherwise',
+        '# TYPE grocy_up gauge',
+        'grocy_up 0',
+        '# HELP grocy_scrape_duration_seconds Duration of the last Grocy API scrape in seconds',
+        '# TYPE grocy_scrape_duration_seconds gauge',
+        `grocy_scrape_duration_seconds ${duration.toFixed(3)}`,
+      ].join('\n') + '\n';
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      res.status(200).send(body);
+    }
+  });
 
   // Middleware to log all requests
   app.use((req, res, next) => {
