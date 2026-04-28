@@ -17,8 +17,10 @@ import https from 'https';
 const STUCK_ERROR_THRESHOLD = 3;
 const STUCK_ERROR_WINDOW_MS = 60_000;
 const stuckErrorTimestamps: number[] = [];
+let transportErrorTotal = 0;
 
 function recordStuckError(context: string) {
+  transportErrorTotal++;
   const now = Date.now();
   stuckErrorTimestamps.push(now);
   while (stuckErrorTimestamps.length > 0 && stuckErrorTimestamps[0]! < now - STUCK_ERROR_WINDOW_MS) {
@@ -144,6 +146,9 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
   // the POST response was ready (flushed on the next GET for the same session).
   const pendingResponses: Map<string, any[]> = new Map();
 
+  // Tech metrics state — request counts by path + status class, accumulated via res.on('finish').
+  const requestCounts: Map<string, Map<string, number>> = new Map();
+
   // Prometheus metrics — registered before the request logger to keep scrapes out of logs.
   app.get('/metrics', async (_req, res) => {
     const start = Date.now();
@@ -165,7 +170,24 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
         ? tasks.filter((t: any) => Number(t.done) === 0).length
         : 0;
 
+      const activeSessions = Object.keys(streamableTransports).length + Object.keys(sseTransports).length;
+      const requestLines: string[] = [];
+      for (const [path, byStatus] of requestCounts) {
+        for (const [statusClass, count] of byStatus) {
+          requestLines.push(`grocy_mcp_http_requests_total{path="${path}",status_class="${statusClass}"} ${count}`);
+        }
+      }
+
       const body = [
+        '# HELP grocy_mcp_http_requests_total HTTP requests served, by path and response status class',
+        '# TYPE grocy_mcp_http_requests_total counter',
+        ...requestLines,
+        '# HELP grocy_mcp_active_sessions Currently active MCP sessions (streamable HTTP + legacy SSE)',
+        '# TYPE grocy_mcp_active_sessions gauge',
+        `grocy_mcp_active_sessions ${activeSessions}`,
+        '# HELP grocy_mcp_transport_errors_total Cumulative transport stuck-error watchdog firings',
+        '# TYPE grocy_mcp_transport_errors_total counter',
+        `grocy_mcp_transport_errors_total ${transportErrorTotal}`,
         '# HELP grocy_up 1 if the Grocy API is reachable, 0 otherwise',
         '# TYPE grocy_up gauge',
         'grocy_up 1',
@@ -197,7 +219,23 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
     } catch (err: any) {
       const duration = (Date.now() - start) / 1000;
       console.error('[ERROR] /metrics Grocy scrape failed:', err?.message);
+      const activeSessions = Object.keys(streamableTransports).length + Object.keys(sseTransports).length;
+      const requestLines: string[] = [];
+      for (const [path, byStatus] of requestCounts) {
+        for (const [statusClass, count] of byStatus) {
+          requestLines.push(`grocy_mcp_http_requests_total{path="${path}",status_class="${statusClass}"} ${count}`);
+        }
+      }
       const body = [
+        '# HELP grocy_mcp_http_requests_total HTTP requests served, by path and response status class',
+        '# TYPE grocy_mcp_http_requests_total counter',
+        ...requestLines,
+        '# HELP grocy_mcp_active_sessions Currently active MCP sessions (streamable HTTP + legacy SSE)',
+        '# TYPE grocy_mcp_active_sessions gauge',
+        `grocy_mcp_active_sessions ${activeSessions}`,
+        '# HELP grocy_mcp_transport_errors_total Cumulative transport stuck-error watchdog firings',
+        '# TYPE grocy_mcp_transport_errors_total counter',
+        `grocy_mcp_transport_errors_total ${transportErrorTotal}`,
         '# HELP grocy_up 1 if the Grocy API is reachable, 0 otherwise',
         '# TYPE grocy_up gauge',
         'grocy_up 0',
@@ -210,8 +248,14 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
     }
   });
 
-  // Middleware to log all requests
+  // Middleware to log all requests and accumulate request-count metrics.
   app.use((req, res, next) => {
+    res.on('finish', () => {
+      const statusClass = `${Math.floor(res.statusCode / 100)}xx`;
+      if (!requestCounts.has(req.path)) requestCounts.set(req.path, new Map());
+      const byStatus = requestCounts.get(req.path)!;
+      byStatus.set(statusClass, (byStatus.get(statusClass) ?? 0) + 1);
+    });
     console.error(`[${new Date().toISOString()}] ${req.method} ${req.path} - Headers: ${JSON.stringify(req.headers)}`);
     next();
   });
