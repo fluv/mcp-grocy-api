@@ -7,82 +7,8 @@ import { VERSION, PACKAGE_NAME as SERVER_NAME } from '../version.js';
 import cors from 'cors';
 import http from 'http';
 
-// Fail-fast watchdog: if "No connection established for request ID" errors
-// recur rapidly, the transport is wedged in a way the fallback paths below
-// can't recover from.  Exit(1) so Kubernetes restarts the pod rather than
-// letting the client hang indefinitely waiting for responses that will never
-// arrive.  Sliding window: N errors within T ms.
-const STUCK_ERROR_THRESHOLD = 3;
-const STUCK_ERROR_WINDOW_MS = 60_000;
-const stuckErrorTimestamps: number[] = [];
-
 function log(level: string, event: string, fields: Record<string, unknown> = {}) {
   console.error(JSON.stringify({ ts: new Date().toISOString(), level, event, ...fields }));
-}
-
-function recordStuckError(context: string) {
-  const now = Date.now();
-  stuckErrorTimestamps.push(now);
-  while (stuckErrorTimestamps.length > 0 && stuckErrorTimestamps[0]! < now - STUCK_ERROR_WINDOW_MS) {
-    stuckErrorTimestamps.shift();
-  }
-  if (stuckErrorTimestamps.length >= STUCK_ERROR_THRESHOLD) {
-    log('FATAL', 'transport_wedged', {
-      count: stuckErrorTimestamps.length,
-      window_ms: STUCK_ERROR_WINDOW_MS,
-      session: context
-    });
-    process.exit(1);
-  }
-}
-
-// Patch a transport's send() to fall back to the standalone GET SSE when the
-// POST connection closes before a response is ready.
-//
-// ClaudeAI sends GET before every POST and closes the POST connection
-// immediately after the request body is sent, expecting responses on the GET
-// SSE stream.  Without this patch those responses are lost with:
-//   "No connection established for request ID: N"
-//
-// When the GET SSE is available the response is written there directly.
-// When it is not (the client closed the old GET and hasn't opened the new one
-// yet — common for fast Grocy errors like 400s), the response is buffered in
-// pendingResponses and flushed as soon as the next GET arrives for the same
-// session.
-function patchTransportSend(
-  transport: StreamableHTTPServerTransport,
-  pendingResponses: Map<string, any[]>
-) {
-  const original = (transport as any).send.bind(transport);
-  (transport as any).send = async (message: any, options?: any) => {
-    try {
-      await original(message, options);
-    } catch (error: any) {
-      if (error?.message?.includes('No connection established for request ID')) {
-        const standaloneSseId: string = (transport as any)._standaloneSseStreamId;
-        const sseStream = (transport as any)._streamMapping?.get(standaloneSseId);
-
-        if (sseStream && !sseStream.writableEnded) {
-          log('FALLBACK', 'post_closed_routed_to_sse');
-          sseStream.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
-        } else {
-          // GET SSE not available yet (client is between GETs); buffer until next GET.
-          const sessionId: string | undefined = transport.sessionId;
-          if (sessionId) {
-            log('FALLBACK', 'no_sse_buffering', { session: sessionId });
-            if (!pendingResponses.has(sessionId)) pendingResponses.set(sessionId, []);
-            pendingResponses.get(sessionId)!.push(message);
-          } else {
-            log('FALLBACK', 'response_dropped', { session: 'none', error: error.message });
-          }
-        }
-
-        recordStuckError(transport.sessionId ?? 'no-session');
-      } else {
-        throw error;
-      }
-    }
-  };
 }
 
 // HTTP Transport for MCP (Context7 style)
@@ -122,26 +48,20 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
   const streamableTransports: Record<string, StreamableHTTPServerTransport> = {};
   const sseTransports: Record<string, SSEServerTransport> = {};
 
-  // Buffered responses for sessions where the GET SSE wasn't available when
-  // the POST response was ready (flushed on the next GET for the same session).
-  const pendingResponses: Map<string, any[]> = new Map();
-
   // Middleware to log all requests
   app.use((req, res, next) => {
     log('INFO', 'request', { method: req.method, path: req.path, headers: req.headers });
     next();
   });
 
-  // GET /mcp — SSE channel: keepalive + fallback response delivery
+  // GET /mcp — SSE keepalive channel.
   //
   // We do NOT call transport.handleRequest here to avoid the SDK's
   // single-stream-per-session limit (which returns 409 when the client
   // reopens GET between tool calls).
   //
-  // Instead:
-  //   1. We manually inject res into the transport's _streamMapping so
-  //      patchTransportSend can route responses here when POST closes early.
-  //   2. We flush any responses buffered while the GET was unavailable.
+  // With enableJsonResponse: true, all responses are delivered on the POST
+  // connection; this GET stream is kept open for keepalive pings only.
   app.get('/mcp', (req, res) => {
     const clientSessionId = req.headers['mcp-session-id'] as string | undefined;
 
@@ -163,36 +83,12 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
     res.setHeader('Mcp-Session-Id', clientSessionId);
     res.flushHeaders();
 
-    // Register as the standalone SSE fallback channel.
-    const standaloneSseId: string = (transport as any)._standaloneSseStreamId;
-    if (standaloneSseId) {
-      (transport as any)._streamMapping?.set(standaloneSseId, res);
-      log('DEBUG', 'sse_registered', { session: clientSessionId });
-    }
-
-    // Flush any responses buffered while GET was unavailable.
-    const pending = pendingResponses.get(clientSessionId);
-    if (pending?.length) {
-      log('FALLBACK', 'flushing_buffered_responses', { session: clientSessionId, count: pending.length });
-      for (const message of pending) {
-        if (!res.writableEnded) {
-          res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
-        }
-      }
-      pendingResponses.delete(clientSessionId);
-    }
-
     const keepalive = setInterval(() => {
       if (!res.writableEnded) res.write(': ping\n\n');
     }, 30000);
 
     res.on('close', () => {
       clearInterval(keepalive);
-      // Deregister only if this is still the current GET SSE.
-      if (standaloneSseId) {
-        const current = (transport as any)._streamMapping?.get(standaloneSseId);
-        if (current === res) (transport as any)._streamMapping?.delete(standaloneSseId);
-      }
     });
   });
 
@@ -255,9 +151,6 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
           enableJsonResponse: true
         });
 
-        // Patch send() to fall back to GET SSE when POST closes early.
-        patchTransportSend(newTransportInstance, pendingResponses);
-
         transport = newTransportInstance;
         streamableTransports[newGeneratedSessionId] = transport;
 
@@ -265,7 +158,6 @@ export function startHttpServer(mcpServer: Server, port: number = 8080) {
           const closedSessionId = transport?.sessionId || newGeneratedSessionId;
           log('DEBUG', 'transport_closed', { session: closedSessionId });
           delete streamableTransports[closedSessionId];
-          pendingResponses.delete(closedSessionId);
         };
 
         log('DEBUG', 'connecting_transport', { session: newGeneratedSessionId });
