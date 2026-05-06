@@ -655,14 +655,26 @@ class GrocyApiServer {
         },
         {
           name: 'get_stock_summary',
-          description: 'Get a Claude-optimised stock summary for recipe planning and shopping. ' +
-            'Returns two lists: in_stock (what you can cook from — name, amount with resolved unit, ' +
-            'location, due date, opened flag, and per-product notes) and missing (products below ' +
-            'minimum stock level — what to put on the shopping list). Units and locations are ' +
-            'resolved to names; Grocy-internal fields are stripped. Prefer this over get_stock.',
+          description: 'Get a Claude-optimised stock summary. Prefer this over get_stock for ' +
+            'recipe planning or shopping. Returns in_stock (products with amount > 0 — product_id, ' +
+            'name, description, amount with resolved unit name and opened count, product group, ' +
+            'due date, per-product notes) and out_of_stock (all active products with no stock, ' +
+            'for shopping context — same fields). Units and groups resolved to names; ' +
+            'Grocy-internal fields stripped. ' +
+            'Use skipOutOfStock=true when only planning recipes (faster — skips product fetch). ' +
+            'Use includeNotes=false to omit per-product userfield notes (faster — skips N API calls).',
           inputSchema: {
             type: 'object',
-            properties: {},
+            properties: {
+              includeNotes: {
+                type: 'boolean',
+                description: 'Include per-product notes from Grocy userfields (default: true). Set false for faster response when notes are not needed.',
+              },
+              skipOutOfStock: {
+                type: 'boolean',
+                description: 'Omit the out_of_stock list (default: false). Set true when only planning recipes, not building a shopping list.',
+              },
+            },
             required: [],
           },
         },
@@ -1222,7 +1234,9 @@ class GrocyApiServer {
           return await this.handleGrocyApiCall('/stock', 'Get current stock');
         case 'get_stock_summary': {
           try {
-            const summary = await this.buildStockSummary();
+            const includeNotes = request.params.arguments?.includeNotes !== false;
+            const skipOutOfStock = request.params.arguments?.skipOutOfStock === true;
+            const summary = await this.buildStockSummary({ includeNotes, skipOutOfStock });
             return { content: [{ type: 'text', text: this.safeJsonStringify(summary) }] };
           } catch (error: any) {
             return { content: [{ type: 'text', text: this.safeJsonStringify({ error: `Failed to build stock summary: ${error.message}` }) }], isError: true };
@@ -1592,27 +1606,25 @@ class GrocyApiServer {
     }
   }
 
-  private async buildStockSummary(): Promise<{ in_stock: any[], missing: any[] }> {
+  private async buildStockSummary(opts: { includeNotes: boolean; skipOutOfStock: boolean }): Promise<{ in_stock: any[]; out_of_stock?: any[] }> {
     const DUE_TYPE: Record<number, string> = { 1: 'BEST_BEFORE', 2: 'EXPIRY_DATE' };
     const NO_DATE = '2999-12-31';
 
-    // Fetch everything in parallel: stock items, volatile (for missing), lookup tables
-    const [stockItems, volatileData, quantityUnits, locations] = await Promise.all([
+    // Parallel fetch: stock + lookup tables always; all-products only when needed for out_of_stock
+    const [stockItems, quantityUnits, productGroups, allProducts] = await Promise.all([
       this.makeApiRequest('/stock', 'GET'),
-      this.makeApiRequest('/api/stock/volatile', 'GET'),
       this.makeApiRequest('/objects/quantity_units', 'GET'),
-      this.makeApiRequest('/objects/locations', 'GET'),
+      this.makeApiRequest('/objects/product_groups', 'GET'),
+      opts.skipOutOfStock ? Promise.resolve([]) : this.makeApiRequest('/objects/products', 'GET'),
     ]);
 
-    const quMap: Record<string, string> = {};
-    if (Array.isArray(quantityUnits)) {
-      for (const qu of quantityUnits) quMap[String(qu.id)] = qu.name;
-    }
-
-    const locationMap: Record<string, string> = {};
-    if (Array.isArray(locations)) {
-      for (const loc of locations) locationMap[String(loc.id)] = loc.name;
-    }
+    const buildMap = (arr: any[], key = 'id', val = 'name'): Record<string, string> => {
+      const map: Record<string, string> = {};
+      if (Array.isArray(arr)) for (const item of arr) map[String(item[key])] = item[val];
+      return map;
+    };
+    const quMap = buildMap(quantityUnits);
+    const groupMap = buildMap(productGroups);
 
     const fetchNotes = async (productId: string | number): Promise<Record<string, string>> => {
       try {
@@ -1629,55 +1641,78 @@ class GrocyApiServer {
     };
 
     const inStockItems: any[] = Array.isArray(stockItems) ? stockItems : [];
-    const missingItems: any[] = Array.isArray(volatileData?.missing_products) ? volatileData.missing_products : [];
 
-    // Fan out all userfields fetches in parallel across both lists
-    const [inStockNotes, missingNotes] = await Promise.all([
-      Promise.all(inStockItems.map((item) => fetchNotes(item.product_id))),
-      Promise.all(missingItems.map((item) => fetchNotes(item.product_id))),
-    ]);
+    // Build set of in-stock product IDs to identify out-of-stock products
+    const inStockIds = new Set(inStockItems.map((item) => String(item.product_id)));
+
+    // out_of_stock: active products not in /stock (amount = 0 or never stocked)
+    const outOfStockItems: any[] = opts.skipOutOfStock
+      ? []
+      : (Array.isArray(allProducts) ? allProducts : []).filter(
+          (p: any) => p.active !== 0 && p.active !== '0' && !inStockIds.has(String(p.id))
+        );
+
+    // Fan out userfields fetches in parallel across whichever lists need them
+    const [inStockNotes, outOfStockNotes] = opts.includeNotes
+      ? await Promise.all([
+          Promise.all(inStockItems.map((item) => fetchNotes(item.product_id))),
+          Promise.all(outOfStockItems.map((p) => fetchNotes(p.id))),
+        ])
+      : [inStockItems.map(() => ({})), outOfStockItems.map(() => ({}))];
 
     const transformInStock = (item: any, notes: Record<string, string>): any => {
       const product = item.product ?? {};
       const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
-      const locationName = product.location_id ? locationMap[String(product.location_id)] : undefined;
+      const amountOpened = Number(item.amount_opened ?? 0);
       const dueDate = item.best_before_date;
 
       const result: any = {
-        id: item.product_id,
+        product_id: item.product_id,
         name: product.name ?? '(unknown)',
-        amount: { value: item.amount, unit },
-        opened: (item.amount_opened ?? 0) > 0,
+        amount: { value: item.amount, unit, ...(amountOpened > 0 ? { opened: amountOpened } : {}) },
       };
-      if (locationName) result.location = locationName;
+      const groupName = product.product_group_id ? groupMap[String(product.product_group_id)] : undefined;
+      if (groupName) result.group = groupName;
+      if (product.description) result.description = product.description;
       if (dueDate && dueDate !== NO_DATE) {
         result.due_date_on_packaging = dueDate;
-        result.due_type = DUE_TYPE[product.due_type] ?? 'BEST_BEFORE';
+        result.due_type = DUE_TYPE[Number(product.due_type)] ?? 'BEST_BEFORE';
       }
       if (Object.keys(notes).length > 0) result.notes = notes;
       return result;
     };
 
-    const transformMissing = (item: any, notes: Record<string, string>): any => {
-      const product = item.product ?? {};
+    const transformOutOfStock = (product: any, notes: Record<string, string>): any => {
       const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
-      const locationName = product.location_id ? locationMap[String(product.location_id)] : undefined;
-
       const result: any = {
-        id: item.product_id,
+        product_id: product.id,
         name: product.name ?? '(unknown)',
-        min_stock: { value: product.min_stock_amount ?? 0, unit },
-        amount: { value: item.amount ?? 0, unit },
+        unit,
       };
-      if (locationName) result.location = locationName;
-      if (Object.keys(notes).length > 0) result.notes = notes;
+      const groupName = product.product_group_id ? groupMap[String(product.product_group_id)] : undefined;
+      if (groupName) result.group = groupName;
+      if (product.description) result.description = product.description;
+      // /objects/products already returns userfields on bulk fetch; use them if present and non-empty
+      const existingUserfields = product.userfields;
+      if (existingUserfields && typeof existingUserfields === 'object' && Object.keys(existingUserfields).length > 0) {
+        const uf: Record<string, string> = {};
+        for (const [k, v] of Object.entries(existingUserfields as Record<string, unknown>)) {
+          if (v !== null && v !== undefined && v !== '') uf[k] = String(v);
+        }
+        if (Object.keys(uf).length > 0) result.notes = { ...uf, ...notes };
+      } else if (Object.keys(notes).length > 0) {
+        result.notes = notes;
+      }
       return result;
     };
 
-    return {
+    const response: { in_stock: any[]; out_of_stock?: any[] } = {
       in_stock: inStockItems.map((item, i) => transformInStock(item, inStockNotes[i])),
-      missing: missingItems.map((item, i) => transformMissing(item, missingNotes[i])),
     };
+    if (!opts.skipOutOfStock) {
+      response.out_of_stock = outOfStockItems.map((p, i) => transformOutOfStock(p, outOfStockNotes[i]));
+    }
+    return response;
   }
 
   private async handleGrocyApiCall(endpoint: string, description: string, options: any = {}) {
