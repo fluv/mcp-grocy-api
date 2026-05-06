@@ -646,10 +646,35 @@ class GrocyApiServer {
         },
         {
           name: 'get_stock',
-          description: 'Get current stock from your Grocy instance.',
+          description: 'Get raw stock data from Grocy. For recipe planning or shopping decisions, prefer get_stock_summary — it resolves units and locations inline and is significantly smaller.',
           inputSchema: {
             type: 'object',
             properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'get_stock_summary',
+          description: 'Get a Claude-optimised stock summary. Prefer this over get_stock for ' +
+            'recipe planning or shopping. Returns in_stock (products with amount > 0 — product_id, ' +
+            'name, description, amount with resolved unit name and opened count, product group, ' +
+            'due date, per-product notes) and out_of_stock (all active products with no stock, ' +
+            'for shopping context — same fields). Units and groups resolved to names; ' +
+            'Grocy-internal fields stripped. ' +
+            'Use skipOutOfStock=true when only planning recipes (faster — skips product fetch). ' +
+            'Use includeNotes=false to omit per-product userfield notes (faster — skips N API calls).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              includeNotes: {
+                type: 'boolean',
+                description: 'Include per-product notes from Grocy userfields (default: true). Set false for faster response when notes are not needed.',
+              },
+              skipOutOfStock: {
+                type: 'boolean',
+                description: 'Omit the out_of_stock list (default: false). Set true when only planning recipes, not building a shopping list.',
+              },
+            },
             required: [],
           },
         },
@@ -1207,6 +1232,16 @@ class GrocyApiServer {
           return await this.handleGrocyApiCall('/objects/recipes', 'Get all recipes');
         case 'get_stock':
           return await this.handleGrocyApiCall('/stock', 'Get current stock');
+        case 'get_stock_summary': {
+          try {
+            const includeNotes = request.params.arguments?.includeNotes !== false;
+            const skipOutOfStock = request.params.arguments?.skipOutOfStock === true;
+            const summary = await this.buildStockSummary({ includeNotes, skipOutOfStock });
+            return { content: [{ type: 'text', text: this.safeJsonStringify(summary) }] };
+          } catch (error: any) {
+            return { content: [{ type: 'text', text: this.safeJsonStringify({ error: `Failed to build stock summary: ${error.message}` }) }], isError: true };
+          }
+        }
         case 'get_batteries':
           return await this.handleGrocyApiCall('/objects/batteries', 'Get all batteries');
         case 'get_equipment':
@@ -1569,6 +1604,115 @@ class GrocyApiServer {
         isError: true,
       };
     }
+  }
+
+  private async buildStockSummary(opts: { includeNotes: boolean; skipOutOfStock: boolean }): Promise<{ in_stock: any[]; out_of_stock?: any[] }> {
+    const DUE_TYPE: Record<number, string> = { 1: 'BEST_BEFORE', 2: 'EXPIRY_DATE' };
+    // 2999-12-31 is Grocy's standard sentinel for "no best-before date set"
+    const NO_DATE = '2999-12-31';
+
+    // Parallel fetch: stock + lookup tables always; all-products (with userfields) only when needed
+    const [stockItems, quantityUnits, productGroups, allProducts] = await Promise.all([
+      this.makeApiRequest('/stock', 'GET'),
+      this.makeApiRequest('/objects/quantity_units', 'GET'),
+      this.makeApiRequest('/objects/product_groups', 'GET'),
+      opts.skipOutOfStock ? Promise.resolve([]) : this.makeApiRequest('/objects/products?include_userfields=true', 'GET'),
+    ]);
+
+    const buildMap = (arr: any[], key = 'id', val = 'name'): Record<string, string> => {
+      const map: Record<string, string> = {};
+      if (Array.isArray(arr)) for (const item of arr) map[String(item[key])] = item[val];
+      return map;
+    };
+    const quMap = buildMap(quantityUnits);
+    const groupMap = buildMap(productGroups);
+
+    const fetchNotes = async (productId: string | number): Promise<Record<string, string>> => {
+      try {
+        const userfields = await this.makeApiRequest(`/userfields/products/${productId}`, 'GET');
+        if (!userfields || typeof userfields !== 'object') return {};
+        const notes: Record<string, string> = {};
+        for (const [k, v] of Object.entries(userfields as Record<string, unknown>)) {
+          if (v !== null && v !== undefined && v !== '') notes[k] = String(v);
+        }
+        return notes;
+      } catch {
+        return {};
+      }
+    };
+
+    const filterNonEmpty = (obj: Record<string, unknown>): Record<string, string> => {
+      const result: Record<string, string> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (v !== null && v !== undefined && v !== '') result[k] = String(v);
+      }
+      return result;
+    };
+
+    const inStockItems: any[] = Array.isArray(stockItems) ? stockItems : [];
+
+    // Build set of in-stock product IDs to identify out-of-stock products
+    const inStockIds = new Set(inStockItems.map((item) => String(item.product_id)));
+
+    // out_of_stock: active products not present in /stock (amount = 0 or never stocked)
+    const outOfStockItems: any[] = opts.skipOutOfStock
+      ? []
+      : (Array.isArray(allProducts) ? allProducts : []).filter(
+          (p: any) => p.active !== 0 && p.active !== '0' && !inStockIds.has(String(p.id))
+        );
+
+    // Fan out per-product userfields fetches for in_stock items only.
+    // out_of_stock userfields come from the bulk /objects/products?include_userfields=true response.
+    const inStockNotes: Record<string, string>[] = opts.includeNotes
+      ? await Promise.all(inStockItems.map((item) => fetchNotes(item.product_id)))
+      : inStockItems.map(() => ({}));
+
+    const transformInStock = (item: any, notes: Record<string, string>): any => {
+      const product = item.product ?? {};
+      const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
+      const amountOpened = Number(item.amount_opened ?? 0);
+      const dueDate = item.best_before_date;
+
+      const result: any = {
+        product_id: item.product_id,
+        name: product.name ?? '(unknown)',
+        amount: { value: item.amount, unit, ...(amountOpened > 0 ? { opened: amountOpened } : {}) },
+      };
+      const groupName = product.product_group_id ? groupMap[String(product.product_group_id)] : undefined;
+      if (groupName) result.group = groupName;
+      if (product.description) result.description = product.description;
+      if (dueDate && dueDate !== NO_DATE) {
+        result.due_date_on_packaging = dueDate;
+        result.due_type = DUE_TYPE[Number(product.due_type)] ?? 'BEST_BEFORE';
+      }
+      if (Object.keys(notes).length > 0) result.notes = notes;
+      return result;
+    };
+
+    const transformOutOfStock = (product: any): any => {
+      const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
+      const result: any = {
+        product_id: product.id,
+        name: product.name ?? '(unknown)',
+        unit,
+      };
+      const groupName = product.product_group_id ? groupMap[String(product.product_group_id)] : undefined;
+      if (groupName) result.group = groupName;
+      if (product.description) result.description = product.description;
+      if (opts.includeNotes && product.userfields && typeof product.userfields === 'object') {
+        const notes = filterNonEmpty(product.userfields as Record<string, unknown>);
+        if (Object.keys(notes).length > 0) result.notes = notes;
+      }
+      return result;
+    };
+
+    const response: { in_stock: any[]; out_of_stock?: any[] } = {
+      in_stock: inStockItems.map((item, i) => transformInStock(item, inStockNotes[i])),
+    };
+    if (!opts.skipOutOfStock) {
+      response.out_of_stock = outOfStockItems.map((p) => transformOutOfStock(p));
+    }
+    return response;
   }
 
   private async handleGrocyApiCall(endpoint: string, description: string, options: any = {}) {
