@@ -1673,7 +1673,10 @@ class GrocyApiServer {
       : inStockItems.map(() => ({}));
 
     const transformInStock = (item: any, notes: Record<string, string>): any => {
-      const product = item.product ?? {};
+      const product = item.product ?? (() => {
+        console.error(`get_stock_summary: item ${item.product_id} has no product object`);
+        return {};
+      })();
       const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
       const amountOpened = Number(item.amount_opened ?? 0);
       const dueDate = item.best_before_date;
