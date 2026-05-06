@@ -646,7 +646,20 @@ class GrocyApiServer {
         },
         {
           name: 'get_stock',
-          description: 'Get current stock from your Grocy instance.',
+          description: 'Get raw stock data from Grocy. For recipe planning or shopping decisions, prefer get_stock_summary — it resolves units and locations inline and is significantly smaller.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'get_stock_summary',
+          description: 'Get a Claude-optimised stock summary for recipe planning and shopping. ' +
+            'Returns two lists: in_stock (what you can cook from — name, amount with resolved unit, ' +
+            'location, due date, opened flag, and per-product notes) and missing (products below ' +
+            'minimum stock level — what to put on the shopping list). Units and locations are ' +
+            'resolved to names; Grocy-internal fields are stripped. Prefer this over get_stock.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -1207,6 +1220,14 @@ class GrocyApiServer {
           return await this.handleGrocyApiCall('/objects/recipes', 'Get all recipes');
         case 'get_stock':
           return await this.handleGrocyApiCall('/stock', 'Get current stock');
+        case 'get_stock_summary': {
+          try {
+            const summary = await this.buildStockSummary();
+            return { content: [{ type: 'text', text: this.safeJsonStringify(summary) }] };
+          } catch (error: any) {
+            return { content: [{ type: 'text', text: this.safeJsonStringify({ error: `Failed to build stock summary: ${error.message}` }) }], isError: true };
+          }
+        }
         case 'get_batteries':
           return await this.handleGrocyApiCall('/objects/batteries', 'Get all batteries');
         case 'get_equipment':
@@ -1569,6 +1590,94 @@ class GrocyApiServer {
         isError: true,
       };
     }
+  }
+
+  private async buildStockSummary(): Promise<{ in_stock: any[], missing: any[] }> {
+    const DUE_TYPE: Record<number, string> = { 1: 'BEST_BEFORE', 2: 'EXPIRY_DATE' };
+    const NO_DATE = '2999-12-31';
+
+    // Fetch everything in parallel: stock items, volatile (for missing), lookup tables
+    const [stockItems, volatileData, quantityUnits, locations] = await Promise.all([
+      this.makeApiRequest('/stock', 'GET'),
+      this.makeApiRequest('/api/stock/volatile', 'GET'),
+      this.makeApiRequest('/objects/quantity_units', 'GET'),
+      this.makeApiRequest('/objects/locations', 'GET'),
+    ]);
+
+    const quMap: Record<string, string> = {};
+    if (Array.isArray(quantityUnits)) {
+      for (const qu of quantityUnits) quMap[String(qu.id)] = qu.name;
+    }
+
+    const locationMap: Record<string, string> = {};
+    if (Array.isArray(locations)) {
+      for (const loc of locations) locationMap[String(loc.id)] = loc.name;
+    }
+
+    const fetchNotes = async (productId: string | number): Promise<Record<string, string>> => {
+      try {
+        const userfields = await this.makeApiRequest(`/userfields/products/${productId}`, 'GET');
+        if (!userfields || typeof userfields !== 'object') return {};
+        const notes: Record<string, string> = {};
+        for (const [k, v] of Object.entries(userfields as Record<string, unknown>)) {
+          if (v !== null && v !== undefined && v !== '') notes[k] = String(v);
+        }
+        return notes;
+      } catch {
+        return {};
+      }
+    };
+
+    const inStockItems: any[] = Array.isArray(stockItems) ? stockItems : [];
+    const missingItems: any[] = Array.isArray(volatileData?.missing_products) ? volatileData.missing_products : [];
+
+    // Fan out all userfields fetches in parallel across both lists
+    const [inStockNotes, missingNotes] = await Promise.all([
+      Promise.all(inStockItems.map((item) => fetchNotes(item.product_id))),
+      Promise.all(missingItems.map((item) => fetchNotes(item.product_id))),
+    ]);
+
+    const transformInStock = (item: any, notes: Record<string, string>): any => {
+      const product = item.product ?? {};
+      const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
+      const locationName = product.location_id ? locationMap[String(product.location_id)] : undefined;
+      const dueDate = item.best_before_date;
+
+      const result: any = {
+        id: item.product_id,
+        name: product.name ?? '(unknown)',
+        amount: { value: item.amount, unit },
+        opened: (item.amount_opened ?? 0) > 0,
+      };
+      if (locationName) result.location = locationName;
+      if (dueDate && dueDate !== NO_DATE) {
+        result.due_date_on_packaging = dueDate;
+        result.due_type = DUE_TYPE[product.due_type] ?? 'BEST_BEFORE';
+      }
+      if (Object.keys(notes).length > 0) result.notes = notes;
+      return result;
+    };
+
+    const transformMissing = (item: any, notes: Record<string, string>): any => {
+      const product = item.product ?? {};
+      const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
+      const locationName = product.location_id ? locationMap[String(product.location_id)] : undefined;
+
+      const result: any = {
+        id: item.product_id,
+        name: product.name ?? '(unknown)',
+        min_stock: { value: product.min_stock_amount ?? 0, unit },
+        amount: { value: item.amount ?? 0, unit },
+      };
+      if (locationName) result.location = locationName;
+      if (Object.keys(notes).length > 0) result.notes = notes;
+      return result;
+    };
+
+    return {
+      in_stock: inStockItems.map((item, i) => transformInStock(item, inStockNotes[i])),
+      missing: missingItems.map((item, i) => transformMissing(item, missingNotes[i])),
+    };
   }
 
   private async handleGrocyApiCall(endpoint: string, description: string, options: any = {}) {
