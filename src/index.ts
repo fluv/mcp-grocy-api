@@ -1608,14 +1608,15 @@ class GrocyApiServer {
 
   private async buildStockSummary(opts: { includeNotes: boolean; skipOutOfStock: boolean }): Promise<{ in_stock: any[]; out_of_stock?: any[] }> {
     const DUE_TYPE: Record<number, string> = { 1: 'BEST_BEFORE', 2: 'EXPIRY_DATE' };
+    // 2999-12-31 is Grocy's standard sentinel for "no best-before date set"
     const NO_DATE = '2999-12-31';
 
-    // Parallel fetch: stock + lookup tables always; all-products only when needed for out_of_stock
+    // Parallel fetch: stock + lookup tables always; all-products (with userfields) only when needed
     const [stockItems, quantityUnits, productGroups, allProducts] = await Promise.all([
       this.makeApiRequest('/stock', 'GET'),
       this.makeApiRequest('/objects/quantity_units', 'GET'),
       this.makeApiRequest('/objects/product_groups', 'GET'),
-      opts.skipOutOfStock ? Promise.resolve([]) : this.makeApiRequest('/objects/products', 'GET'),
+      opts.skipOutOfStock ? Promise.resolve([]) : this.makeApiRequest('/objects/products?include_userfields=true', 'GET'),
     ]);
 
     const buildMap = (arr: any[], key = 'id', val = 'name'): Record<string, string> => {
@@ -1640,25 +1641,31 @@ class GrocyApiServer {
       }
     };
 
+    const filterNonEmpty = (obj: Record<string, unknown>): Record<string, string> => {
+      const result: Record<string, string> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (v !== null && v !== undefined && v !== '') result[k] = String(v);
+      }
+      return result;
+    };
+
     const inStockItems: any[] = Array.isArray(stockItems) ? stockItems : [];
 
     // Build set of in-stock product IDs to identify out-of-stock products
     const inStockIds = new Set(inStockItems.map((item) => String(item.product_id)));
 
-    // out_of_stock: active products not in /stock (amount = 0 or never stocked)
+    // out_of_stock: active products not present in /stock (amount = 0 or never stocked)
     const outOfStockItems: any[] = opts.skipOutOfStock
       ? []
       : (Array.isArray(allProducts) ? allProducts : []).filter(
           (p: any) => p.active !== 0 && p.active !== '0' && !inStockIds.has(String(p.id))
         );
 
-    // Fan out userfields fetches in parallel across whichever lists need them
-    const [inStockNotes, outOfStockNotes] = opts.includeNotes
-      ? await Promise.all([
-          Promise.all(inStockItems.map((item) => fetchNotes(item.product_id))),
-          Promise.all(outOfStockItems.map((p) => fetchNotes(p.id))),
-        ])
-      : [inStockItems.map(() => ({})), outOfStockItems.map(() => ({}))];
+    // Fan out per-product userfields fetches for in_stock items only.
+    // out_of_stock userfields come from the bulk /objects/products?include_userfields=true response.
+    const inStockNotes: Record<string, string>[] = opts.includeNotes
+      ? await Promise.all(inStockItems.map((item) => fetchNotes(item.product_id)))
+      : inStockItems.map(() => ({}));
 
     const transformInStock = (item: any, notes: Record<string, string>): any => {
       const product = item.product ?? {};
@@ -1682,7 +1689,7 @@ class GrocyApiServer {
       return result;
     };
 
-    const transformOutOfStock = (product: any, notes: Record<string, string>): any => {
+    const transformOutOfStock = (product: any): any => {
       const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
       const result: any = {
         product_id: product.id,
@@ -1692,16 +1699,9 @@ class GrocyApiServer {
       const groupName = product.product_group_id ? groupMap[String(product.product_group_id)] : undefined;
       if (groupName) result.group = groupName;
       if (product.description) result.description = product.description;
-      // /objects/products already returns userfields on bulk fetch; use them if present and non-empty
-      const existingUserfields = product.userfields;
-      if (existingUserfields && typeof existingUserfields === 'object' && Object.keys(existingUserfields).length > 0) {
-        const uf: Record<string, string> = {};
-        for (const [k, v] of Object.entries(existingUserfields as Record<string, unknown>)) {
-          if (v !== null && v !== undefined && v !== '') uf[k] = String(v);
-        }
-        if (Object.keys(uf).length > 0) result.notes = { ...uf, ...notes };
-      } else if (Object.keys(notes).length > 0) {
-        result.notes = notes;
+      if (opts.includeNotes && product.userfields && typeof product.userfields === 'object') {
+        const notes = filterNonEmpty(product.userfields as Record<string, unknown>);
+        if (Object.keys(notes).length > 0) result.notes = notes;
       }
       return result;
     };
@@ -1710,7 +1710,7 @@ class GrocyApiServer {
       in_stock: inStockItems.map((item, i) => transformInStock(item, inStockNotes[i])),
     };
     if (!opts.skipOutOfStock) {
-      response.out_of_stock = outOfStockItems.map((p, i) => transformOutOfStock(p, outOfStockNotes[i]));
+      response.out_of_stock = outOfStockItems.map((p) => transformOutOfStock(p));
     }
     return response;
   }
