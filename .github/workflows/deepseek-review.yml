@@ -1,0 +1,21 @@
+name: DeepSeek Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: zuzak/deepseek-review-action@main
+        with:
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          exclude-paths: |
+            node_modules/**
+            package-lock.json
+            build/**
+          label-deadlock: vet:deadlock
