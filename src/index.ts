@@ -1649,7 +1649,12 @@ class GrocyApiServer {
       return result;
     };
 
-    const inStockItems: any[] = Array.isArray(stockItems) ? stockItems : [];
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Filter out zero-amount items — these are typically parent/umbrella products whose
+    // children carry the real stock; treating them as available misleads recipe planning.
+    const inStockItems: any[] = (Array.isArray(stockItems) ? stockItems : [])
+      .filter((item: any) => Number(item.amount) > 0);
 
     // Build set of in-stock product IDs to identify out-of-stock products
     const inStockIds = new Set(inStockItems.map((item) => String(item.product_id)));
@@ -1684,6 +1689,10 @@ class GrocyApiServer {
       if (dueDate && dueDate !== NO_DATE) {
         result.due_date_on_packaging = dueDate;
         result.due_type = DUE_TYPE[Number(product.due_type)] ?? 'BEST_BEFORE';
+        if (dueDate < today) {
+          // BEST_BEFORE past = overdue (may still be usable); EXPIRY_DATE past = expired (do not use)
+          result.status = result.due_type === 'EXPIRY_DATE' ? 'expired' : 'overdue';
+        }
       }
       if (Object.keys(notes).length > 0) result.notes = notes;
       return result;
