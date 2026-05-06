@@ -1171,8 +1171,22 @@ class GrocyApiServer {
           return await this.handleCustomGrocyApiCall(request);
         case 'open_product':
           return await this.handleOpenProduct(request);
-        case 'get_stock_volatile':
-          return await this.handleGrocyApiCall('/api/stock/volatile', 'Get volatile stock information', request.params.arguments?.includeDetails ? {query_params: {include_details: "true"}} : {});
+        case 'get_stock_volatile': {
+          try {
+            const qs = request.params.arguments?.includeDetails ? '?include_details=true' : '';
+            const volatileData = await this.makeApiRequest(`/api/stock/volatile${qs}`, 'GET');
+            // Hydrate each sub-list in parallel; missing_products may lack product_id (no-op per item)
+            const lists = ['due_products', 'overdue_products', 'expired_products', 'missing_products'] as const;
+            await Promise.all(lists.map(async (key) => {
+              if (Array.isArray(volatileData?.[key])) {
+                volatileData[key] = await this.hydrateStockItemUserfields(volatileData[key]);
+              }
+            }));
+            return { content: [{ type: 'text', text: this.safeJsonStringify(volatileData) }] };
+          } catch (error: any) {
+            return { content: [{ type: 'text', text: this.safeJsonStringify({ error: `Failed to get volatile stock: ${error.message}` }) }], isError: true };
+          }
+        }
         case 'get_shopping_list':
           return await this.handleGrocyApiCall('/objects/shopping_list', 'Get shopping list items');
         case 'get_chores':
@@ -1205,8 +1219,15 @@ class GrocyApiServer {
           return await this.handleGrocyApiCall('/objects/products', 'Get all products');
         case 'get_recipes':
           return await this.handleGrocyApiCall('/objects/recipes', 'Get all recipes');
-        case 'get_stock':
-          return await this.handleGrocyApiCall('/stock', 'Get current stock');
+        case 'get_stock': {
+          try {
+            const stockData = await this.makeApiRequest('/stock', 'GET');
+            const hydrated = await this.hydrateStockItemUserfields(Array.isArray(stockData) ? stockData : []);
+            return { content: [{ type: 'text', text: this.safeJsonStringify(hydrated) }] };
+          } catch (error: any) {
+            return { content: [{ type: 'text', text: this.safeJsonStringify({ error: `Failed to get stock: ${error.message}` }) }], isError: true };
+          }
+        }
         case 'get_batteries':
           return await this.handleGrocyApiCall('/objects/batteries', 'Get all batteries');
         case 'get_equipment':
@@ -1569,6 +1590,41 @@ class GrocyApiServer {
         isError: true,
       };
     }
+  }
+
+  // Fetch userfields for each stock item in parallel and merge into item.product.userfields.
+  // On per-item failure, attaches an error stub with a hint for Claude to retry directly.
+  private async hydrateStockItemUserfields(items: any[]): Promise<any[]> {
+    if (!Array.isArray(items) || items.length === 0) return items;
+
+    return Promise.all(
+      items.map(async (item) => {
+        const productId = item.product_id;
+        if (!productId) return item;
+
+        try {
+          const userfields = await this.makeApiRequest(`/userfields/products/${productId}`, 'GET');
+          return {
+            ...item,
+            product: {
+              ...item.product,
+              userfields: userfields ?? {},
+            },
+          };
+        } catch (error: any) {
+          return {
+            ...item,
+            product: {
+              ...item.product,
+              userfields: {
+                _hydration_error: `Userfields fetch failed for product ${productId}. ` +
+                  `Call GET userfields/products/${productId} directly. Error: ${error.message}`,
+              },
+            },
+          };
+        }
+      })
+    );
   }
 
   private async handleGrocyApiCall(endpoint: string, description: string, options: any = {}) {
