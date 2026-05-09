@@ -8,6 +8,7 @@ import cors from 'cors';
 import http from 'http';
 import axios from 'axios';
 import https from 'https';
+import { log } from '../logger.js';
 
 // Fail-fast watchdog: if "No connection established for request ID" errors
 // recur rapidly, the transport is wedged in a way the fallback paths below
@@ -27,11 +28,11 @@ function recordStuckError(context: string) {
     stuckErrorTimestamps.shift();
   }
   if (stuckErrorTimestamps.length >= STUCK_ERROR_THRESHOLD) {
-    console.error(
-      `[FATAL] ${stuckErrorTimestamps.length} "No connection established" errors ` +
-        `within ${STUCK_ERROR_WINDOW_MS}ms (${context}); transport is wedged, exiting ` +
-        `to let Kubernetes restart the pod.`
-    );
+    log.fatal('Transport wedged — too many "No connection established" errors; exiting for Kubernetes restart', {
+      errorCount: stuckErrorTimestamps.length,
+      windowMs: STUCK_ERROR_WINDOW_MS,
+      context,
+    });
     process.exit(1);
   }
 }
@@ -63,17 +64,17 @@ function patchTransportSend(
         const sseStream = (transport as any)._streamMapping?.get(standaloneSseId);
 
         if (sseStream && !sseStream.writableEnded) {
-          console.error(`[FALLBACK] POST closed — routing response to open GET SSE`);
+          log.warn('POST closed — routing response to open GET SSE', { sessionId: transport.sessionId });
           sseStream.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
         } else {
           // GET SSE not available yet (client is between GETs); buffer until next GET.
           const sessionId: string | undefined = transport.sessionId;
           if (sessionId) {
-            console.error(`[FALLBACK] No GET SSE — buffering response for session ${sessionId}`);
+            log.warn('No GET SSE available — buffering response', { sessionId });
             if (!pendingResponses.has(sessionId)) pendingResponses.set(sessionId, []);
             pendingResponses.get(sessionId)!.push(message);
           } else {
-            console.error(`[FALLBACK] No session ID — response dropped (${error.message})`);
+            log.warn('No session ID — response dropped', { errMsg: error.message });
           }
         }
 
@@ -218,7 +219,7 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
       res.status(200).send(body);
     } catch (err: any) {
       const duration = (Date.now() - start) / 1000;
-      console.error('[ERROR] /metrics Grocy scrape failed:', err?.message);
+      log.error('/metrics Grocy scrape failed', { errMsg: err?.message });
       const activeSessions = Object.keys(streamableTransports).length + Object.keys(sseTransports).length;
       const requestLines: string[] = [];
       for (const [path, byStatus] of requestCounts) {
@@ -256,7 +257,7 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
       const byStatus = requestCounts.get(req.path)!;
       byStatus.set(statusClass, (byStatus.get(statusClass) ?? 0) + 1);
     });
-    console.error(`[${new Date().toISOString()}] ${req.method} ${req.path} - Headers: ${JSON.stringify(req.headers)}`);
+    log.info('HTTP request', { method: req.method, path: req.path });
     next();
   });
 
@@ -280,7 +281,7 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
 
     const transport = streamableTransports[clientSessionId];
     if (!transport) {
-      console.error(`[DEBUG] GET /mcp: session ${clientSessionId} not found — returning 404`);
+      log.debug('GET /mcp: session not found', { sessionId: clientSessionId });
       res.status(404).json({ error: `Session not found: ${clientSessionId}` });
       return;
     }
@@ -295,13 +296,13 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
     const standaloneSseId: string = (transport as any)._standaloneSseStreamId;
     if (standaloneSseId) {
       (transport as any)._streamMapping?.set(standaloneSseId, res);
-      console.error(`[DEBUG] GET /mcp: SSE registered for session ${clientSessionId}`);
+      log.debug('GET /mcp: SSE registered', { sessionId: clientSessionId });
     }
 
     // Flush any responses buffered while GET was unavailable.
     const pending = pendingResponses.get(clientSessionId);
     if (pending?.length) {
-      console.error(`[FALLBACK] Flushing ${pending.length} buffered response(s) to new GET SSE`);
+      log.warn('Flushing buffered responses to new GET SSE', { sessionId: clientSessionId, count: pending.length });
       for (const message of pending) {
         if (!res.writableEnded) {
           res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
@@ -333,7 +334,7 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
       // Accept header check (can be done early)
       const accept = req.headers.accept || '';
       if (!accept.includes('application/json') && !accept.includes('text/event-stream') && !accept.includes('*/*')) {
-        console.error('[ERROR] Client must accept application/json or text/event-stream');
+        log.error('Client must accept application/json or text/event-stream', { accept });
         res.status(406).json({
           jsonrpc: '2.0',
           error: {
@@ -348,15 +349,15 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
       if (clientSessionId) {
         transport = streamableTransports[clientSessionId];
         if (transport) {
-          console.error(`[DEBUG] Using existing transport for session ID: ${clientSessionId}`);
+          log.debug('Using existing transport', { sessionId: clientSessionId });
         } else {
           // Unknown session ID — only recover for initialize, otherwise 404 per MCP spec
           const isInitialize = req.body?.method === 'initialize';
           if (isInitialize) {
-            console.error(`[DEBUG] Session ${clientSessionId} not found but initialize received — creating new session`);
+            log.debug('Session not found but initialize received — creating new session', { sessionId: clientSessionId });
             // Fall through to create new transport below
           } else {
-            console.error(`[DEBUG] Session ${clientSessionId} not found and request is not initialize — returning 404`);
+            log.debug('Session not found and request is not initialize — returning 404', { sessionId: clientSessionId });
             res.status(404).json({
               jsonrpc: '2.0',
               error: { code: -32001, message: `Session not found: ${clientSessionId}. Please re-initialize.` },
@@ -373,17 +374,17 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
         // single _transport on the Server and overwrites it on every connect(), so a
         // shared Server causes responses for session A to be dispatched through session
         // B's transport after B connects.
-        console.error('[DEBUG] No active transport found. Creating new transport.');
+        log.debug('No active transport found — creating new transport');
         const newGeneratedSessionId = randomUUID();
         const sessionServer = createMcpServer();
 
         const newTransportInstance = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => {
-            console.error(`[DEBUG] StreamableHTTPServerTransport sessionIdGenerator using ID: ${newGeneratedSessionId}`);
+            log.debug('StreamableHTTPServerTransport sessionIdGenerator called', { sessionId: newGeneratedSessionId });
             return newGeneratedSessionId;
           },
           onsessioninitialized: (initializedSid: string) => {
-            console.error(`[DEBUG] Session initialized with ID: ${initializedSid}`);
+            log.debug('Session initialized', { sessionId: initializedSid });
           },
           enableJsonResponse: true
         });
@@ -395,9 +396,9 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
         streamableTransports[newGeneratedSessionId] = transport;
         streamableServers[newGeneratedSessionId] = sessionServer;
 
-        console.error(`[DEBUG] Connecting new transport (ID: ${newGeneratedSessionId}) to session server`);
+        log.debug('Connecting new transport to session server', { sessionId: newGeneratedSessionId });
         await sessionServer.connect(transport);
-        console.error(`[DEBUG] New transport connected`);
+        log.debug('New transport connected', { sessionId: newGeneratedSessionId });
 
         // Re-install cleanup AFTER connect(): the SDK's connect() overwrites
         // transport.onclose to clear its own _transport reference.  We chain our
@@ -406,12 +407,12 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
         transport.onclose = async () => {
           await sdkOnClose?.();
           const closedSessionId = transport?.sessionId || newGeneratedSessionId;
-          console.error(`[DEBUG] Transport for session ${closedSessionId} closed. Removing.`);
+          log.debug('Transport closed — removing session', { sessionId: closedSessionId });
           delete streamableTransports[closedSessionId];
           delete streamableServers[closedSessionId];
           pendingResponses.delete(closedSessionId);
           sessionServer.close().catch((err: Error) =>
-            console.error(`[DEBUG] Error closing session server ${closedSessionId}:`, err)
+            log.err('debug', 'Error closing session server', err, { sessionId: closedSessionId })
           );
         };
       }
@@ -423,7 +424,7 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
       await transport.handleRequest(req, res, req.body);
 
     } catch (error) {
-      console.error('[ERROR] Failed to handle streamable HTTP request:', error);
+      log.err('error', 'Failed to handle streamable HTTP request', error);
 
       if (!res.headersSent) {
         res.status(500).json({
@@ -440,7 +441,7 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
 
   // Legacy SSE endpoint
   app.get('/mcp/sse', async (req, res) => {
-    console.error('[DEBUG] Incoming SSE connection request');
+    log.debug('Incoming SSE connection request');
 
     try {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -451,7 +452,7 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
       const sessionId = transport.sessionId;
       const sseSessionServer = createMcpServer();
 
-      console.error(`[DEBUG] Created SSE transport with session ID: ${sessionId}`);
+      log.debug('Created SSE transport', { sessionId });
       sseTransports[sessionId] = transport;
       sseServers[sessionId] = sseSessionServer;
 
@@ -460,27 +461,27 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
       }, 30000);
 
       res.on('close', () => {
-        console.error(`[DEBUG] SSE connection closed for session ID: ${sessionId}`);
+        log.debug('SSE connection closed', { sessionId });
         clearInterval(keepalive);
         delete sseTransports[sessionId];
         delete sseServers[sessionId];
         sseSessionServer.close().catch((err: Error) =>
-          console.error(`[DEBUG] Error closing SSE session server ${sessionId}:`, err)
+          log.err('debug', 'Error closing SSE session server', err, { sessionId })
         );
       });
 
       res.on('error', (err) => {
-        console.error(`[ERROR] SSE connection error for session ID: ${sessionId}:`, err);
+        log.err('error', 'SSE connection error', err, { sessionId });
         clearInterval(keepalive);
         delete sseTransports[sessionId];
         delete sseServers[sessionId];
       });
 
       await sseSessionServer.connect(transport);
-      console.error(`[DEBUG] SSE transport connected for session ${sessionId}`);
+      log.debug('SSE transport connected', { sessionId });
       res.write(': connected\n\n');
     } catch (error) {
-      console.error('[ERROR] Failed to handle SSE connection:', error);
+      log.err('error', 'Failed to handle SSE connection', error);
       if (!res.headersSent) {
         res.status(500).send('Internal Server Error');
       } else {
@@ -492,10 +493,10 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
   // Message endpoint for legacy SSE
   app.post('/mcp/messages', async (req, res) => {
     const sessionId = req.query.sessionId as string;
-    console.error(`[DEBUG] Incoming message for SSE session ID: ${sessionId}`);
+    log.debug('Incoming message for SSE session', { sessionId });
 
     if (!sessionId) {
-      console.error('[ERROR] No sessionId provided in request');
+      log.error('No sessionId provided in request');
       res.status(400).json({
         error: 'Missing sessionId parameter',
         status: 400
@@ -506,17 +507,17 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
     const transport = sseTransports[sessionId];
     if (transport) {
       try {
-        console.error(`[DEBUG] Found transport for session ID: ${sessionId}, handling message`);
+        log.debug('Found transport for session — handling message', { sessionId });
         await transport.handlePostMessage(req, res, req.body);
       } catch (error) {
-        console.error(`[ERROR] Failed to handle SSE message for session ID: ${sessionId}:`, error);
+        log.err('error', 'Failed to handle SSE message', error, { sessionId });
         res.status(500).json({
           error: `Internal server error: ${error instanceof Error ? error.message : String(error)}`,
           status: 500
         });
       }
     } else {
-      console.error(`[ERROR] No transport found for session ID: ${sessionId}`);
+      log.error('No transport found for session', { sessionId });
       res.status(404).json({
         error: `No active SSE connection found for session ID: ${sessionId}`,
         status: 404
@@ -528,16 +529,19 @@ export function startHttpServer(createMcpServer: () => Server, port: number = 80
   const server = http.createServer(app);
 
   server.on('error', (error) => {
-    console.error(`[ERROR] HTTP server error: ${error.message}`);
+    log.error('HTTP server error', { errMsg: error.message });
   });
 
   server.listen(port, () => {
-    console.error(`[MCP] HTTP server listening on port ${port}`);
-    console.error(`[MCP] Available endpoints:`);
-    console.error(`[MCP]   - Health check: http://localhost:${port}/`);
-    console.error(`[MCP]   - Streamable HTTP: http://localhost:${port}/mcp`);
-    console.error(`[MCP]   - SSE: http://localhost:${port}/mcp/sse`);
-    console.error(`[MCP]   - SSE Messages: http://localhost:${port}/mcp/messages`);
+    log.info('HTTP server listening', {
+      port,
+      endpoints: {
+        health:     `http://localhost:${port}/`,
+        streamable: `http://localhost:${port}/mcp`,
+        sse:        `http://localhost:${port}/mcp/sse`,
+        sseMessages:`http://localhost:${port}/mcp/messages`,
+      },
+    });
   });
 
   return server;
