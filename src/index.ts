@@ -17,12 +17,13 @@ import axios, { AxiosInstance, AxiosRequestConfig, Method } from 'axios';
 import { VERSION, PACKAGE_NAME as SERVER_NAME } from './version.js';
 import { startHttpServer } from './server/http-server.js';
 import { z } from 'zod';
+import { log } from './logger.js';
 
 // Debug output to help identify version and naming issues
-console.error(`Starting ${SERVER_NAME} server version ${VERSION}`);
+log.info('Starting server', { name: SERVER_NAME, version: VERSION });
 
 if (!process.env.GROCY_BASE_URL) {
-  console.error('GROCY_BASE_URL environment variable is not set. Setting default to http://localhost:9283');
+  log.warn('GROCY_BASE_URL not set — defaulting to http://localhost:9283');
   process.env.GROCY_BASE_URL = 'http://localhost:9283';
 }
 
@@ -207,14 +208,14 @@ class GrocyApiServer {
     this.setupToolHandlers();
     this.setupResourceHandlers();
     
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
+    this.server.onerror = (error) => log.err('error', 'MCP error', error);
     process.on('SIGINT', async () => {
       await this.server.close();
       process.exit(0);
     });
 
     this.server.setRequestHandler(InitializeRequestSchema, async (request) => {
-      console.error('[DEBUG] Initialize handler called with request:', JSON.stringify(request));
+      log.debug('Initialize handler called', { request });
       return {
         capabilities: {
           tools: {},
@@ -236,7 +237,7 @@ class GrocyApiServer {
       params: z.any().optional()
     });
     this.server.setRequestHandler(PlainInitializeRequestSchema, async (request) => {
-      console.error('[DEBUG] Plain "initialize" handler called with request:', JSON.stringify(request));
+      log.debug('Plain initialize handler called', { request });
       // Extract protocolVersion from request.params or fallback to a default
       let protocolVersion = '2024-11-05';
       if (request.params && typeof request.params.protocolVersion === 'string') {
@@ -291,10 +292,10 @@ class GrocyApiServer {
     this.setupResourceHandlers();
     this.server = savedServer;
 
-    sessionServer.onerror = (error) => console.error('[MCP Error]', error);
+    sessionServer.onerror = (error) => log.err('error', 'MCP error', error);
 
     sessionServer.setRequestHandler(InitializeRequestSchema, async (request) => {
-      console.error('[DEBUG] Initialize handler called with request:', JSON.stringify(request));
+      log.debug('Initialize handler called', { request });
       return {
         capabilities: { tools: {}, resources: {}, prompts: {} },
         serverInfo: { name: SERVER_NAME, version: VERSION }
@@ -308,7 +309,7 @@ class GrocyApiServer {
       params: z.any().optional()
     });
     sessionServer.setRequestHandler(PlainInitializeRequestSchema, async (request) => {
-      console.error('[DEBUG] Plain "initialize" handler called with request:', JSON.stringify(request));
+      log.debug('Plain initialize handler called', { request });
       let protocolVersion = '2024-11-05';
       if (request.params && typeof request.params.protocolVersion === 'string') {
         protocolVersion = request.params.protocolVersion;
@@ -324,8 +325,7 @@ class GrocyApiServer {
   }
 
   private makeApiRequest = async (endpoint: string, method: Method = 'GET', body: any = null, additionalHeaders: Record<string, string> = {}, isSpecial: boolean = false): Promise<any> => {
-    // Enhanced endpoint path handling with better logging (using stderr to avoid breaking JSON responses)
-    console.error(`Original endpoint: ${endpoint}, Method: ${method}, isSpecial: ${isSpecial}`);
+    log.debug('API request start', { endpoint, method, isSpecial });
     
     // Standardize path handling
     let normalizedEndpoint = endpoint;
@@ -355,7 +355,7 @@ class GrocyApiServer {
       }
     }
     
-    console.error(`Final endpoint URL: ${normalizeBaseUrl(process.env.GROCY_BASE_URL!)}${normalizedEndpoint}`);
+    log.debug('Resolved endpoint', { url: `${normalizeBaseUrl(process.env.GROCY_BASE_URL!)}${normalizedEndpoint}` });
 
     const config: AxiosRequestConfig = {
       method,
@@ -371,7 +371,7 @@ class GrocyApiServer {
 
     if (['POST', 'PUT'].includes(method) && body) {
       config.data = body;
-      console.error(`Request body: ${JSON.stringify(body)}`);
+      log.debug('Request body', { body });
     }
 
     // Only apply API Key authentication
@@ -383,11 +383,11 @@ class GrocyApiServer {
     }
 
     try {
-      console.error(`Making ${method} request to ${normalizeBaseUrl(process.env.GROCY_BASE_URL!)}${normalizedEndpoint}`);
+      log.debug('Making API request', { method, url: `${normalizeBaseUrl(process.env.GROCY_BASE_URL!)}${normalizedEndpoint}` });
       const response = await this.axiosInstance.request(config);
       
       if (response.status >= 400) {
-        console.error(`API error (${response.status}): ${JSON.stringify(response.data)}`);
+        log.error('API error response', { status: response.status, data: response.data });
         throw new Error(`API error (${response.status}): ${JSON.stringify(response.data)}`);
       }
       
@@ -396,18 +396,18 @@ class GrocyApiServer {
       // Improve error handling with more detailed error messages
       if (axios.isAxiosError(error)) {
         if (error.code === 'ECONNABORTED') {
-          console.error('API request timeout:', error.message);
+          log.error('API request timeout', { errMsg: error.message });
           throw new Error(`Connection timeout: The server took too long to respond. Please check your network connection or server availability.`);
         } else if (error.code === 'ECONNRESET' || error.message.includes('socket hang up')) {
-          console.error('API connection reset:', error.message);
+          log.error('API connection reset', { errMsg: error.message });
           throw new Error(`Connection reset: The server unexpectedly closed the connection. This might be due to server overload or network issues.`);
         } else if (!error.response) {
-          console.error('API network error:', error.message);
+          log.error('API network error', { errMsg: error.message });
           throw new Error(`Network error: Unable to reach the Grocy server. Please verify that the server is running and accessible.`);
         }
       }
       
-      console.error('API request error:', error);
+      log.err('error', 'API request error', error);
       throw error;
     }
   };
@@ -1396,7 +1396,7 @@ class GrocyApiServer {
           
           const choreTimestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
           const executeUrl = `/api/chores/${choreId}/execute`;
-          console.error(`Executing chore with URL: ${executeUrl}`); // Using stderr instead of stdout
+          log.debug('Executing chore', { url: executeUrl });
           
           const choreData = {
             tracked_time: tracked_time || choreTimestamp,
@@ -1562,7 +1562,7 @@ class GrocyApiServer {
     try {
       return JSON.stringify(data, null, 2);
     } catch (error) {
-      console.error('Error stringifying JSON:', error);
+      log.err('error', 'Error stringifying JSON', error);
       return JSON.stringify({ error: 'Error formatting response data' }, null, 2);
     }
   }
@@ -1591,7 +1591,7 @@ class GrocyApiServer {
         ],
       };
     } catch (error: any) {
-      console.error(`Error calling Grocy API endpoint ${endpoint}:`, error);
+      log.err('error', 'Error calling Grocy API endpoint', error, { endpoint });
       return {
         content: [
           {
@@ -1753,7 +1753,7 @@ class GrocyApiServer {
         ],
       };
     } catch (error: any) {
-      console.error(`Error in ${description}:`, error);
+      log.err('error', 'Error in operation', error, { description });
       return {
         content: [
           {
@@ -1926,19 +1926,19 @@ class GrocyApiServer {
       let targetProductId = productId;
       
       if (!productId && stockEntryId) {
-        console.error(`No product ID provided but stock entry ID ${stockEntryId} given. Attempting to get product ID from stock entry.`);
+        log.debug('No product ID — resolving from stock entry', { stockEntryId });
         
         try {
           // First try to get the product ID from the stock entry
           const stockEntryData = await this.makeApiRequest(`/api/stock/entry/${stockEntryId}`, 'GET');
           if (stockEntryData && stockEntryData.product_id) {
             targetProductId = stockEntryData.product_id;
-            console.error(`Successfully resolved product ID ${targetProductId} from stock entry ${stockEntryId}`);
+            log.debug('Resolved product ID from stock entry', { productId: targetProductId, stockEntryId });
           } else {
             throw new Error(`Could not resolve product ID from stock entry ${stockEntryId}`);
           }
         } catch (stockEntryError: any) {
-          console.error(`Failed to get product ID from stock entry: ${stockEntryError.message}`);
+          log.error('Failed to get product ID from stock entry', { stockEntryId, errMsg: stockEntryError.message });
           // Continue with the error handling below
           throw new Error(`Failed to get product ID from stock entry: ${stockEntryError.message}`);
         }
@@ -1950,7 +1950,7 @@ class GrocyApiServer {
       
       // Use the proper path format with explicit /api prefix
       const endpoint = `/api/stock/products/${targetProductId}/open`;
-      console.error(`Making open product request to ${endpoint} with body:`, body);
+      log.debug('Making open product request', { endpoint, body });
       
       // Don't use isSpecial=true flag as we're now using the explicit /api prefix
       const data = await this.makeApiRequest(endpoint, 'POST', body);
@@ -1963,7 +1963,7 @@ class GrocyApiServer {
         ],
       };
     } catch (error: any) {
-      console.error(`Error opening product:`, error);
+      log.err('error', 'Error opening product', error);
       return {
         content: [
           {
@@ -2122,17 +2122,16 @@ class GrocyApiServer {
     // Start STDIO transport
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Grocy API MCP server running on stdio');
+    log.info('Grocy API MCP server running on stdio');
 
     // Start HTTP/SSE transport
     // Process environment variables with detailed logging
-    console.error('[CONFIG] ENABLE_HTTP_SERVER:', process.env.ENABLE_HTTP_SERVER);
-    console.error('[CONFIG] HTTP_SERVER_PORT:', process.env.HTTP_SERVER_PORT);
+    log.info('Config', { ENABLE_HTTP_SERVER: process.env.ENABLE_HTTP_SERVER, HTTP_SERVER_PORT: process.env.HTTP_SERVER_PORT });
     
     // Accept various formats of "true" values for better compatibility
     const enableHttpServer = ['true', 'yes', '1', 'on', 'enabled'].includes(String(process.env.ENABLE_HTTP_SERVER || '').toLowerCase());
     
-    console.error(`[CONFIG] HTTP Server will be ${enableHttpServer ? 'enabled' : 'disabled'}`);
+    log.info('HTTP server config', { enabled: enableHttpServer });
     
     if (enableHttpServer) {
       try {
@@ -2141,21 +2140,20 @@ class GrocyApiServer {
         const port = portStr ? parseInt(String(portStr), 10) : 8080;
         
         if (isNaN(port)) {
-          console.error(`[ERROR] Invalid HTTP port value: ${portStr}, using default 8080`);
+          log.error('Invalid HTTP port value — using default 8080', { portStr });
         }
         
         // Start HTTP server
-        console.error(`[CONFIG] Starting HTTP/SSE server on port ${port}`);
+        log.info('Starting HTTP/SSE server', { port });
         startHttpServer(() => this.createSessionServer(), port);
       } catch (error) {
-        console.error(`[ERROR] Failed to start HTTP/SSE server:`, error);
+        log.err('error', 'Failed to start HTTP/SSE server', error);
       }
     } else {
-      console.error('[CONFIG] HTTP/SSE server is disabled');
-      console.error('[CONFIG] To enable, set ENABLE_HTTP_SERVER=true in environment variables');
+      log.info('HTTP/SSE server is disabled — set ENABLE_HTTP_SERVER=true to enable');
     }
   }
 }
 
 const server = new GrocyApiServer();
-server.run().catch(console.error);
+server.run().catch((err) => log.err('fatal', 'Server startup failed', err));
