@@ -1673,6 +1673,9 @@ class GrocyApiServer {
       : inStockItems.map(() => ({}));
 
     const transformInStock = (item: any, notes: Record<string, string>): any => {
+      if (!item.product) {
+        console.error(`get_stock_summary: item ${item.product_id} has no product object`);
+      }
       const product = item.product ?? {};
       const unit = quMap[String(product.qu_id_stock)] ?? 'unit';
       const amountOpened = Number(item.amount_opened ?? 0);
