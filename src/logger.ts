@@ -54,8 +54,8 @@ function emit(level: LogLevel, msg: string, ctx?: Record<string, unknown>): void
   };
   try {
     process.stderr.write(JSON.stringify(entry) + '\n');
-  } catch {
-    process.stderr.write(JSON.stringify({ time: entry.time, level, msg, err: 'log serialisation failed' }) + '\n');
+  } catch (e) {
+    process.stderr.write(JSON.stringify({ time: entry.time, level, msg, err: `log serialisation failed: ${String(e)}` }) + '\n');
   }
 }
 
