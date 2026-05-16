@@ -6,8 +6,32 @@
 //
 // Each log line is a JSON object with at least: time, level, msg.
 // Additional context fields may be supplied as the second argument.
+//
+// Set LOG_LEVEL to suppress messages below a minimum severity.
+// Accepted values: debug, info, warn, error, fatal. Defaults to info.
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+
+const LEVEL_ORDER: Record<LogLevel, number> = {
+  debug: 0,
+  info:  1,
+  warn:  2,
+  error: 3,
+  fatal: 4,
+};
+
+function parseMinLevel(): LogLevel {
+  const raw = (process.env.LOG_LEVEL ?? 'info').toLowerCase();
+  if (raw in LEVEL_ORDER) return raw as LogLevel;
+  process.stderr.write(JSON.stringify({
+    time: new Date().toISOString(),
+    level: 'warn',
+    msg: `Unknown LOG_LEVEL "${raw}", defaulting to "info"`,
+  }) + '\n');
+  return 'info';
+}
+
+const MIN_LEVEL = parseMinLevel();
 
 // Normalise an Error object to a plain serialisable structure.
 function serializeError(err: unknown): Record<string, unknown> {
@@ -21,13 +45,18 @@ function serializeError(err: unknown): Record<string, unknown> {
 }
 
 function emit(level: LogLevel, msg: string, ctx?: Record<string, unknown>): void {
+  if (LEVEL_ORDER[level] < LEVEL_ORDER[MIN_LEVEL]) return;
   const entry: Record<string, unknown> = {
     time: new Date().toISOString(),
     level,
     msg,
     ...ctx,
   };
-  process.stderr.write(JSON.stringify(entry) + '\n');
+  try {
+    process.stderr.write(JSON.stringify(entry) + '\n');
+  } catch {
+    process.stderr.write(JSON.stringify({ time: entry.time, level, msg, err: 'log serialisation failed' }) + '\n');
+  }
 }
 
 export const log = {
